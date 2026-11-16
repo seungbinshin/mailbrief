@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mailbrief"
+version = "0.2.0"
+license = { text = "MIT" }
+description = "Daily Outlook mail digest and missed/upcoming schedule detection with an in-house LLM"
+requires-python = ">=3.11"
+dependencies = ["pywin32>=306; sys_platform == 'win32'"]  # Outlook COM (default source on Windows)
+
+[project.optional-dependencies]
+graph = ["msal>=1.28"]
+ews = ["exchangelib>=5.4"]
+dev = ["pytest>=8"]
+
+[project.scripts]
+mailbrief = "mailbrief.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src", "tests"]

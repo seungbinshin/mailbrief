@@ -1,0 +1,76 @@
+# mailbrief configuration. Copy to config.toml and edit.
+# Paths: use forward slashes or doubled backslashes on Windows ("C:/certs/ca.pem" or "C:\\certs\\ca.pem").
+
+[llm]
+# OpenAI-compatible endpoint of the in-house LLM (vLLM / TGI / Ollama / LiteLLM ...). Include /v1.
+base_url = "http://llm.internal.corp:8000/v1"
+model = "in-house-llm"
+api_key_env = "MAILBRIEF_LLM_API_KEY"   # environment variable that holds the key (empty = no auth)
+temperature = 0.0
+max_tokens = 1024         # Korean JSON output needs >= 1024 (see docs/CLASSIFICATION_GUIDE.md)
+timeout_s = 60
+json_mode = true          # turned off automatically if the server rejects response_format
+max_retries = 2
+verify_tls = true
+ca_bundle = ""            # corporate CA bundle for HTTPS endpoints
+system_in_user = false    # true for models without a system role (e.g. Gemma)
+# extra_body = { chat_template_kwargs = { enable_thinking = false } }   # e.g. Qwen3: turn off thinking
+
+[source]
+# com   = Outlook desktop (Classic) on Windows. Default. No app registration, no password.
+# ews   = on-premise Exchange via Exchange Web Services
+# graph = Exchange Online (Microsoft 365) via Microsoft Graph (Entra app registration)
+type = "com"
+my_address = "me@corp.com"
+max_mails = 200
+# graph
+tenant_id = ""
+client_id = ""
+token_cache = "~/.mailbrief/msal_cache.json"
+graph_send_scope = false
+# ews
+email = ""
+username = ""             # DOMAIN\\user or UPN
+password_env = "MAILBRIEF_EWS_PASSWORD"
+ews_server = ""           # empty = autodiscover
+
+[analysis]
+timezone = "Asia/Seoul"
+digest_hours = 24         # daily digest window
+lookback_days = 7         # window to detect missed items
+lookahead_days = 7        # window for upcoming items
+reply_overdue_hours = 48
+event_match_minutes = 30
+max_body_chars = 4000
+retry_body_chars = 1500   # second try with a shorter body
+min_body_chars = 5
+debug_dump = false        # true: save prompt + raw output of failed mails to out/debug/
+skip_senders = ["noreply@corp.com"]
+
+# Classification: label = rule. Edit to match your team. Keep <= 7 labels, keep "other" last.
+[analysis.categories]
+action_required = "내가 해야 할 일(검토, 회신, 제출, 승인)이 있는 메일"
+meeting = "회의 초대, 일정 변경, 회의록"
+fyi = "참고용 공유. 내가 할 일 없음"
+announcement = "전사/부서 공지, 교육, 제도 안내"
+newsletter = "뉴스레터, 광고, 구독 메일"
+other = "위 분류에 맞지 않는 메일"
+
+# Other words the model outputs -> label (check `mailbrief diagnose --sample 30` warnings)
+[analysis.category_aliases]
+"조치필요" = "action_required"
+
+[output]
+dir = "out"
+formats = ["md", "html"]
+send_to_self = false      # also mail the HTML report to my_address
+db_path = "~/.mailbrief/state.sqlite3"
+popup = true              # card popup after `run` and at brief_times
+open_html = false         # also open the card page in the browser
+
+[watch]
+poll_minutes = 5          # check for new mail every N minutes (catch-up after sleep, other sources)
+use_com_events = true     # Outlook NewMailEx event: react within seconds (com source)
+notify_priority = 1       # popup for new mail with priority <= this (1 = high only)
+notify_due_hours = 24     # popup for new mail with my action due within N hours
+brief_times = ["08:30"]   # full briefing + card popup at these times (HH:MM)

@@ -1,0 +1,14 @@
+[
+  {"id": "e1", "subject": "아키텍처 리뷰", "start": "2026-11-14T14:00:00+09:00", "end": "2026-11-14T15:00:00+09:00",
+   "organizer": "lee@corp.com", "response_status": "none", "response_requested": true},
+  {"id": "e2", "subject": "Daily standup", "start": "2026-11-17T10:00:00+09:00", "end": "2026-11-17T10:15:00+09:00",
+   "organizer": "choi@corp.com", "response_status": "accepted", "location": "Teams"},
+  {"id": "e3", "subject": "Weekly sync", "start": "2026-11-18T10:00:00+09:00", "end": "2026-11-18T11:00:00+09:00",
+   "organizer": "choi@corp.com", "response_status": "none", "response_requested": true},
+  {"id": "e4", "subject": "1:1", "start": "2026-11-19T09:00:00+09:00", "end": "2026-11-19T09:30:00+09:00",
+   "organizer": "kim.manager@corp.com", "response_status": "declined"},
+  {"id": "e5", "subject": "연차", "start": "2026-11-20T00:00:00+09:00", "end": "2026-11-21T00:00:00+09:00",
+   "organizer": "me@corp.com", "is_organizer": true, "response_status": "organizer", "is_all_day": true},
+  {"id": "e6", "subject": "취소된 회의", "start": "2026-11-18T15:00:00+09:00", "end": "2026-11-18T16:00:00+09:00",
+   "organizer": "x@corp.com", "response_status": "none", "is_cancelled": true}
+]

@@ -1,0 +1,80 @@
+"""SQLite state: cached LLM results, extraction failures, action item status, notifications."""
+from __future__ import annotations
+
+import json
+import sqlite3
+import threading
+from datetime import datetime
+from pathlib import Path
+
+from .models import MailInsight
+
+_SCHEMA = """
+CREATE TABLE IF NOT EXISTS insights (
+  email_id TEXT, model TEXT, data TEXT, created TEXT, PRIMARY KEY (email_id, model));
+CREATE TABLE IF NOT EXISTS failures (
+  id INTEGER PRIMARY KEY AUTOINCREMENT, email_id TEXT, subject TEXT, code TEXT, message TEXT,
+  body_chars INTEGER, raw TEXT, warnings TEXT, created TEXT);
+CREATE TABLE IF NOT EXISTS action_status (
+  key TEXT PRIMARY KEY, status TEXT, updated TEXT);
+CREATE TABLE IF NOT EXISTS notified (
+  email_id TEXT PRIMARY KEY, created TEXT);
+CREATE TABLE IF NOT EXISTS runs (
+  id INTEGER PRIMARY KEY AUTOINCREMENT, started TEXT, mails INTEGER, llm_calls INTEGER, errors INTEGER);
+"""
+
+
+class Store:
+    def __init__(self, path: str | Path) -> None:
+        if str(path) != ":memory:":
+            Path(path).parent.mkdir(parents=True, exist_ok=True)
+        self.db = sqlite3.connect(str(path), check_same_thread=False)
+        self.lock = threading.Lock()
+        self.db.executescript(_SCHEMA)
+        cols = [r[1] for r in self.db.execute("PRAGMA table_info(insights)")]
+        if "model" not in cols:  # very old schema
+            self.db.executescript("DROP TABLE insights;" + _SCHEMA)
+
+    def _exec(self, sql: str, args=()):
+        with self.lock:
+            cur = self.db.execute(sql, args)
+            self.db.commit()
+            return cur
+
+    def get_insight(self, email_id: str, model: str) -> MailInsight | None:
+        with self.lock:
+            row = self.db.execute("SELECT data FROM insights WHERE email_id=? AND model=?", (email_id, model)).fetchone()
+        return MailInsight.from_dict(json.loads(row[0])) if row else None
+
+    def put_insight(self, ins: MailInsight, model: str) -> None:
+        self._exec("INSERT OR REPLACE INTO insights VALUES (?,?,?,?)",
+                   (ins.email_id, model, json.dumps(ins.to_dict(), ensure_ascii=False), datetime.now().isoformat()))
+
+    def add_failure(self, f) -> None:
+        self._exec("INSERT INTO failures(email_id, subject, code, message, body_chars, raw, warnings, created) "
+                   "VALUES (?,?,?,?,?,?,?,?)",
+                   (f.email_id, f.subject, f.code, f.message, f.body_chars, f.raw,
+                    json.dumps(f.warnings, ensure_ascii=False), datetime.now().isoformat()))
+
+    def failures(self, limit: int = 200) -> list[dict]:
+        with self.lock:
+            cur = self.db.execute("SELECT email_id, subject, code, message, body_chars, raw, warnings, created "
+                                  "FROM failures ORDER BY id DESC LIMIT ?", (limit,))
+            names = [c[0] for c in cur.description]
+            return [dict(zip(names, r)) for r in cur.fetchall()]
+
+    def set_action_status(self, key: str, status: str) -> None:
+        self._exec("INSERT OR REPLACE INTO action_status VALUES (?,?,?)", (key, status, datetime.now().isoformat()))
+
+    def done_keys(self) -> set[str]:
+        with self.lock:
+            return {r[0] for r in self.db.execute("SELECT key FROM action_status WHERE status='done'")}
+
+    def mark_notified(self, email_id: str) -> bool:
+        """Return True if this is the first notification for the mail."""
+        cur = self._exec("INSERT OR IGNORE INTO notified VALUES (?,?)", (email_id, datetime.now().isoformat()))
+        return cur.rowcount == 1
+
+    def log_run(self, started: datetime, mails: int, llm_calls: int, errors: int) -> None:
+        self._exec("INSERT INTO runs(started, mails, llm_calls, errors) VALUES (?,?,?,?)",
+                   (started.isoformat(), mails, llm_calls, errors))
