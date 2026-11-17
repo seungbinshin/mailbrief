@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mailbrief"
-version = "0.2.0"
+version = "0.3.0"
 license = { text = "MIT" }
 description = "Daily Outlook mail digest and missed/upcoming schedule detection with an in-house LLM"
 requires-python = ">=3.11"

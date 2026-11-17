@@ -15,6 +15,10 @@ class MailSource(ABC):
     @abstractmethod
     def fetch_events(self, start: datetime, end: datetime) -> list[Event]: ...
 
+    def fetch_sent(self, since: datetime, limit: int) -> list[Email]:
+        """Mails that I sent (folder="sent"). They complete the threads: my replies show who has the ball."""
+        return []
+
     def send_to_self(self, subject: str, html_body: str) -> None:
         raise NotImplementedError(f"{type(self).__name__} does not support sending")
 

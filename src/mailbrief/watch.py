@@ -4,7 +4,8 @@
 - Trigger 2: polling every `watch.poll_minutes` (all sources; also catches mails that the event missed,
   e.g. mails that arrived while the PC was asleep).
 - Read state does not matter: a mail that you already read in Outlook is processed the same way.
-- Each mail is analyzed once (SQLite cache) and notified at most once (`notified` table).
+- A new mail is analyzed with its whole thread (1 LLM call per thread revision, SQLite cache) and notified
+  at most once (`notified` table). The thread result also updates the story tracker.
 """
 from __future__ import annotations
 
@@ -22,7 +23,7 @@ from .cards import Card, CardItem, save_cards
 from .config import Config, expand
 from .llm import OpenAICompatClient
 from .models import Email, MailInsight
-from .pipeline import analyze_mails, run
+from .pipeline import analyze_threads, fetch_threads, make_tracker, run
 from .sources import make_source
 from .store import Store
 
@@ -56,6 +57,26 @@ def open_popup(cards_json: Path) -> None:
         w = exe[:-10] + "pythonw.exe"
         exe = w if Path(w).exists() else exe  # pythonw: no console window
     subprocess.Popen([exe, "-m", "mailbrief", "popup", str(cards_json)], close_fds=True)
+
+
+def _process_new(cfg: Config, new: list[Email], source, store: Store, llm,
+                 now: datetime) -> list[tuple[Email, MailInsight, str]]:
+    """Analyze the threads of the new mails (with the older mails of the thread) and update the stories."""
+    _, threads = fetch_threads(cfg, source, now - timedelta(days=cfg.analysis.lookback_days))
+    new_ids = {m.id for m in new}
+    hit = [t for t in threads if new_ids & set(t.ids)]
+    tracker = make_tracker(cfg, store)
+    insights, _ = analyze_threads(cfg, hit, llm, store, open_stories=tracker.prompt_stories() if tracker else [])
+    if tracker:
+        tracker.ingest(hit, insights, now)
+    out = []
+    for t in hit:  # one popup line per thread, for its newest new mail
+        ins = insights.get(t.key)
+        m = next((x for x in reversed(t.mails) if x.id in new_ids), None)
+        r = should_notify(m, ins, cfg, now) if (ins and m) else ""
+        if r:
+            out.append((m, ins, r))
+    return out
 
 
 class _ComEvents:
@@ -120,9 +141,7 @@ def watch(cfg: Config, once: bool = False, popup: bool = True, llm=None, source=
                 mails = source.fetch_mails(since, cfg.source.max_mails)
                 new = [m for m in mails if store.mark_notified(m.id)]  # first time seen (read or unread)
                 if new:
-                    insights, _ = analyze_mails(cfg, new, llm, store)
-                    hits = [(m, insights[m.id], r) for m in new if m.id in insights
-                            for r in [should_notify(m, insights[m.id], cfg, now)] if r]
+                    hits = _process_new(cfg, new, source, store, llm, now)
                     notified.extend(hits)
                     log.info("new mails: %d, notify: %d", len(new), len(hits))
                     if hits and popup:

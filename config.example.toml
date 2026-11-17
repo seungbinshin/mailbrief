@@ -7,7 +7,7 @@ base_url = "http://llm.internal.corp:8000/v1"
 model = "in-house-llm"
 api_key_env = "MAILBRIEF_LLM_API_KEY"   # environment variable that holds the key (empty = no auth)
 temperature = 0.0
-max_tokens = 1024         # Korean JSON output needs >= 1024 (see docs/CLASSIFICATION_GUIDE.md)
+max_tokens = 1536         # thread JSON with story facts in Korean needs >= 1536 (see docs/CLASSIFICATION_GUIDE.md)
 timeout_s = 60
 json_mode = true          # turned off automatically if the server rejects response_format
 max_retries = 2
@@ -23,6 +23,7 @@ system_in_user = false    # true for models without a system role (e.g. Gemma)
 type = "com"
 my_address = "me@corp.com"
 max_mails = 200
+include_sent = true       # also read Sent Items: my replies complete the threads (who has the ball)
 # graph
 tenant_id = ""
 client_id = ""
@@ -46,6 +47,8 @@ retry_body_chars = 1500   # second try with a shorter body
 min_body_chars = 5
 debug_dump = false        # true: save prompt + raw output of failed mails to out/debug/
 skip_senders = ["noreply@corp.com"]
+max_thread_messages = 8   # messages of one thread in one LLM call (first + latest 7)
+thread_gap_days = 14      # same subject without conversation id: max gap to join one thread
 
 # Classification: label = rule. Edit to match your team. Keep <= 7 labels, keep "other" last.
 [analysis.categories]
@@ -60,12 +63,35 @@ other = "위 분류에 맞지 않는 메일"
 [analysis.category_aliases]
 "조치필요" = "action_required"
 
+# Meeting type: the LLM decides from the body, the invite and the attendees (not from the subject only).
+[analysis.meeting_types]
+regular = "정기 회의(주간·월간 sync, 스탠드업, 정례 보고)"
+review = "검토·리뷰 회의(설계 리뷰, 결과 보고, 검증 리뷰)"
+decision = "의사결정 회의(승인, 방향 결정, 우선순위 결정)"
+external = "고객·협력사 등 외부 참석자가 있는 회의"
+other = "위에 맞지 않는 회의"
+
+# Story = one goal that needs tracking over time (not one mail). See docs/STORY_TRACKING.md.
+# A thread is a story only if persistence + owner + end condition are all present and the LLM is sure.
+# Not sure -> review queue. No match with an open story is NEVER a reason to make a story.
+[stories]
+enabled = true
+min_confidence = 0.8      # LLM confidence: high = 0.9, medium = 0.6, low = 0.3. Below -> review queue
+non_story_categories = ["newsletter", "announcement"]   # never a story; persistence here -> review queue
+auto_sender_patterns = ["^no-?reply", "^do-?not-?reply", "^mailer-daemon", "^postmaster", "notification",
+                        "^alerts?\\b", "^automail", "^system", "^newsletter", "^news\\b"]   # regex on the part before @
+prompt_stories = 30       # open stories shown to the LLM to match a thread to a story
+duplicate_similarity = 0.6
+link_gap_days = 14        # subject-only links older than this do not attach automatically
+export_dir = ""           # story folders, e.g. "out/stories" (empty = off)
+
 [output]
 dir = "out"
 formats = ["md", "html"]
 send_to_self = false      # also mail the HTML report to my_address
 db_path = "~/.mailbrief/state.sqlite3"
 popup = true              # card popup after `run` and at brief_times
+dashboard = true          # story dashboard: out/stories.html
 open_html = false         # also open the card page in the browser
 
 [watch]

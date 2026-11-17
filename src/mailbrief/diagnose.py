@@ -2,8 +2,8 @@
 
 Modes:
   diagnose              summary of logged failures, grouped by code, with the fix to check
-  diagnose --sample 30  classify the last 30 mails now (no cache), print distribution, warnings, failures
-  diagnose --retry      re-run only the mails that failed before, dump prompt + raw output to out/debug/
+  diagnose --sample 30  classify the last 30 threads now (no cache): distribution, story route, warnings, failures
+  diagnose --retry      re-run only the threads that failed before, dump prompt + raw output to out/debug/
 """
 from __future__ import annotations
 
@@ -15,9 +15,10 @@ from zoneinfo import ZoneInfo
 
 from .config import Config, expand
 from .llm import OpenAICompatClient
-from .pipeline import make_extractor
+from .pipeline import fetch_threads, make_extractor, make_tracker, my_address
 from .sources import make_source
 from .store import Store
+from .stories import judge
 
 HINTS = {
     "E_TRANSPORT": "엔드포인트 접속 실패/타임아웃/5xx/429. base_url, 프록시(사내 NO_PROXY), timeout_s, 동시 호출 수(--workers) 확인.",
@@ -56,29 +57,36 @@ def diagnose(cfg: Config, sample: int = 0, retry: bool = False, limit: int = 200
 
     tz = ZoneInfo(cfg.analysis.timezone)
     source = make_source(cfg.source, tz)
-    mails = source.fetch_mails(datetime.now(tz) - timedelta(days=days), max(sample, cfg.source.max_mails))
+    cfg.source.max_mails = max(sample, cfg.source.max_mails)
+    _, threads = fetch_threads(cfg, source, datetime.now(tz) - timedelta(days=days))
     if retry:
         failed = {r["email_id"] for r in store.failures(limit)}
-        mails = [m for m in mails if m.id in failed]
-        print(f"재시도 대상 {len(mails)}건 (기간 {days}일 내)")
+        threads = [t for t in threads if failed & set(t.ids)]
+        print(f"재시도 대상 {len(threads)}개 스레드 (기간 {days}일 내)")
     else:
-        mails = mails[:sample]
+        threads = threads[:sample]
     cfg.analysis.debug_dump = True
     ex = make_extractor(cfg, OpenAICompatClient(cfg.llm), None)
-    cats = collections.Counter()
-    for m in mails:
-        ins = ex.analyze(m)
+    tracker = make_tracker(cfg, store)
+    open_stories = tracker.prompt_stories() if tracker else []
+    cats, routes = collections.Counter(), collections.Counter()
+    for t in threads:
+        ins = ex.analyze(t, open_stories)
         cats[ins.category if ins.by_llm else f"(fallback) {ins.category}"] += 1
+        route = judge(t, ins, cfg.stories, my_address(cfg)).route if ins.by_llm else "pending"
+        routes[route] += 1
         mark = "OK " if ins.by_llm else f"ERR {ins.fail_code}"
-        print(f"{mark:14} {ins.category:16} p{ins.priority} {m.subject[:60]}")
-        for w in ex.warnings.get(m.id, []):
+        n = f" ({len(t.mails)}통)" if len(t.mails) > 1 else ""
+        print(f"{mark:14} {ins.category:16} {route:7} p{ins.priority} {t.subject[:56]}{n}")
+        for w in ex.warnings.get(t.latest.id, []):
             print(f"{'':14} warn: {w}")
     for f in ex.failures:
         store.add_failure(f)
-    n = len(mails) or 1
-    print(f"\n성공률: {(n - len(ex.failures)) / n:.0%} ({n - len(ex.failures)}/{len(mails)}), "
-          f"정규화 경고 메일: {len(ex.warnings)}")
+    n = len(threads) or 1
+    print(f"\n성공률: {(n - len(ex.failures)) / n:.0%} ({n - len(ex.failures)}/{len(threads)} 스레드), "
+          f"정규화 경고 스레드: {len(ex.warnings)}")
     print("분류 분포:", json.dumps(dict(cats), ensure_ascii=False))
+    print("스토리 판정:", json.dumps(dict(routes), ensure_ascii=False), "(story = 스토리, review = 검토 대기, none = 아님)")
     if ex.failures:
         print(f"실패 원인: {dict(collections.Counter(f.code for f in ex.failures))}")
         print(f"프롬프트/원문 출력 덤프: {Path(cfg.output.dir) / 'debug'}")

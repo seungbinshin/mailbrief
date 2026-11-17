@@ -69,36 +69,46 @@ class GraphSource:
             url = data.get("@odata.nextLink")
 
     # ---- mail ----
-    def fetch_mails(self, since: datetime, limit: int) -> list[Email]:
+    def _to_email(self, m: dict, folder: str) -> Email:
+        frm = (m.get("from") or {}).get("emailAddress", {})
+        due = ((m.get("flag") or {}).get("dueDateTime") or {}).get("dateTime")
+        when = m.get("sentDateTime") if folder == "sent" else m.get("receivedDateTime")
+        return Email(
+            id=m["id"],
+            subject=m.get("subject") or "",
+            sender=frm.get("address", "") or (self.cfg.my_address if folder == "sent" else ""),
+            sender_name=frm.get("name", ""),
+            received=_parse(when or m["receivedDateTime"], self.tz),
+            body_text=(m.get("body") or {}).get("content", ""),
+            to=[r["emailAddress"]["address"] for r in m.get("toRecipients", [])],
+            cc=[r["emailAddress"]["address"] for r in m.get("ccRecipients", [])],
+            is_read=folder == "sent" or m.get("isRead", False),
+            importance=m.get("importance", "normal"),
+            conversation_id=m.get("conversationId", ""),
+            has_attachments=m.get("hasAttachments", False),
+            flag_due=_parse(due, self.tz) if due else None,
+            is_meeting_request=m.get("meetingMessageType") == "meetingRequest",
+            message_id=m.get("internetMessageId", "") or "",
+            folder=folder,
+        )
+
+    def _fetch(self, folder: str, field: str, kind: str, since: datetime, limit: int) -> list[Email]:
         q = urllib.parse.urlencode({
-            "$filter": f"receivedDateTime ge {since.astimezone(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')}",
-            "$orderby": "receivedDateTime desc",
+            "$filter": f"{field} ge {since.astimezone(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')}",
+            "$orderby": f"{field} desc",
             "$top": "50",
-            "$select": "id,subject,from,toRecipients,ccRecipients,receivedDateTime,body,isRead,importance,"
-                       "conversationId,hasAttachments,flag,meetingMessageType",
+            "$select": "id,subject,from,toRecipients,ccRecipients,receivedDateTime,sentDateTime,body,isRead,"
+                       "importance,conversationId,hasAttachments,flag,meetingMessageType,internetMessageId",
         })
         headers = {"Prefer": f'outlook.body-content-type="text", outlook.timezone="{self.tz.key}"'}
-        out = []
-        for m in self._paged(f"{GRAPH}/me/mailFolders/inbox/messages?{q}", headers, limit):
-            frm = (m.get("from") or {}).get("emailAddress", {})
-            due = ((m.get("flag") or {}).get("dueDateTime") or {}).get("dateTime")
-            out.append(Email(
-                id=m["id"],
-                subject=m.get("subject") or "",
-                sender=frm.get("address", ""),
-                sender_name=frm.get("name", ""),
-                received=_parse(m["receivedDateTime"], self.tz),
-                body_text=(m.get("body") or {}).get("content", ""),
-                to=[r["emailAddress"]["address"] for r in m.get("toRecipients", [])],
-                cc=[r["emailAddress"]["address"] for r in m.get("ccRecipients", [])],
-                is_read=m.get("isRead", False),
-                importance=m.get("importance", "normal"),
-                conversation_id=m.get("conversationId", ""),
-                has_attachments=m.get("hasAttachments", False),
-                flag_due=_parse(due, self.tz) if due else None,
-                is_meeting_request=m.get("meetingMessageType") == "meetingRequest",
-            ))
-        return out
+        return [self._to_email(m, kind)
+                for m in self._paged(f"{GRAPH}/me/mailFolders/{folder}/messages?{q}", headers, limit)]
+
+    def fetch_mails(self, since: datetime, limit: int) -> list[Email]:
+        return self._fetch("inbox", "receivedDateTime", "inbox", since, limit)
+
+    def fetch_sent(self, since: datetime, limit: int) -> list[Email]:
+        return self._fetch("sentitems", "sentDateTime", "sent", since, limit)
 
     # ---- calendar ----
     def fetch_events(self, start: datetime, end: datetime) -> list[Event]:

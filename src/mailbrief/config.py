@@ -13,7 +13,7 @@ class LLMConfig:
     model: str = "in-house-llm"
     api_key_env: str = "MAILBRIEF_LLM_API_KEY"
     temperature: float = 0.0
-    max_tokens: int = 1024
+    max_tokens: int = 1536          # thread JSON with story facts; Korean needs many tokens
     timeout_s: int = 60
     json_mode: bool = True  # send response_format={"type":"json_object"}
     max_retries: int = 2
@@ -47,6 +47,7 @@ class SourceConfig:
     # common
     my_address: str = ""
     max_mails: int = 200
+    include_sent: bool = True       # also read Sent Items: my replies complete the threads
 
 
 DEFAULT_CATEGORIES = {
@@ -56,6 +57,15 @@ DEFAULT_CATEGORIES = {
     "announcement": "전사/부서 공지, 교육, 제도 안내",
     "newsletter": "뉴스레터, 광고, 구독 메일",
     "other": "위 분류에 맞지 않는 메일",
+}
+
+
+DEFAULT_MEETING_TYPES = {
+    "regular": "정기 회의(주간·월간 sync, 스탠드업, 정례 보고)",
+    "review": "검토·리뷰 회의(설계 리뷰, 결과 보고, 검증 리뷰)",
+    "decision": "의사결정 회의(승인, 방향 결정, 우선순위 결정)",
+    "external": "고객·협력사 등 외부 참석자가 있는 회의",
+    "other": "위에 맞지 않는 회의",
 }
 
 
@@ -76,6 +86,27 @@ class AnalysisConfig:
     retry_body_chars: int = 1500    # second try with a shorter body after E_CONTEXT / E_TRUNCATED / E_BAD_JSON
     min_body_chars: int = 5         # body shorter than this -> classify by rules (no LLM call)
     debug_dump: bool = False        # save prompt + raw output of failed mails under output.dir/debug
+    max_thread_messages: int = 8    # messages of one thread sent to the LLM (first + latest N-1)
+    thread_gap_days: int = 14       # same subject without conversation id: max gap to join one thread
+    # Meeting type labels. The LLM decides from body, invite and attendees, not from the subject only.
+    meeting_types: dict[str, str] = field(default_factory=lambda: dict(DEFAULT_MEETING_TYPES))
+
+
+@dataclass
+class StoryConfig:
+    """Story = one goal that needs tracking over time. See docs/STORY_TRACKING.md."""
+    enabled: bool = True
+    min_confidence: float = 0.8     # LLM confidence: high = 0.9, medium = 0.6, low = 0.3. Below -> review queue
+    # Categories that are never a story. Persistence in these categories goes to the review queue.
+    non_story_categories: list[str] = field(default_factory=lambda: ["newsletter", "announcement"])
+    # Regex on the sender local part (before @): automatic senders are never a story.
+    auto_sender_patterns: list[str] = field(default_factory=lambda: [
+        r"^no-?reply", r"^do-?not-?reply", r"^mailer-daemon", r"^postmaster", r"notification", r"^alerts?\b",
+        r"^automail", r"^system", r"^newsletter", r"^news\b"])
+    prompt_stories: int = 30        # open stories shown to the LLM for matching
+    duplicate_similarity: float = 0.6   # new story similar to an open story -> review "possible_duplicate"
+    link_gap_days: int = 14         # subject-only thread link older than this does not attach automatically
+    export_dir: str = ""            # write story folders here (empty = off), e.g. "out/stories"
 
 
 @dataclass
@@ -85,6 +116,7 @@ class OutputConfig:
     send_to_self: bool = False
     db_path: str = "~/.mailbrief/state.sqlite3"
     popup: bool = True              # show the card popup after `run` (Windows desktop)
+    dashboard: bool = True          # write out/stories.html (story dashboard) after `run`
     open_html: bool = False         # open the HTML card page in the browser after `run`
 
 
@@ -104,6 +136,7 @@ class Config:
     analysis: AnalysisConfig = field(default_factory=AnalysisConfig)
     output: OutputConfig = field(default_factory=OutputConfig)
     watch: WatchConfig = field(default_factory=WatchConfig)
+    stories: StoryConfig = field(default_factory=StoryConfig)
 
 
 def _fill(cls, data: dict):
@@ -128,6 +161,7 @@ def load_config(path: str | Path | None) -> Config:
         analysis=_fill(AnalysisConfig, raw.get("analysis", {})),
         output=_fill(OutputConfig, raw.get("output", {})),
         watch=_fill(WatchConfig, raw.get("watch", {})),
+        stories=_fill(StoryConfig, raw.get("stories", {})),
     )
 
 

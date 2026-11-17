@@ -10,13 +10,19 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 
 from .models import (RESP_DECLINED, RESP_NONE, RESP_NOT_RESPONDED, ActionItem, Email, Event, MailInsight,
-                     MentionedEvent)
+                     MentionedEvent, Thread)
+from .threads import is_mine
 
 
 @dataclass
 class DigestEntry:
-    mail: Email
-    insight: MailInsight
+    mail: Email                 # latest inbox mail of the thread (sender shown in the digest)
+    insight: MailInsight        # analysis of the whole thread
+    thread: Thread | None = None
+
+    @property
+    def count(self) -> int:
+        return len(self.thread.mails) if self.thread else 1
 
 
 @dataclass
@@ -39,6 +45,7 @@ class Report:
     upcoming: list[Finding] = field(default_factory=list)   # deadlines and mail-only events ahead
     briefing: str = ""
     stats: dict = field(default_factory=dict)
+    stories: dict = field(default_factory=dict)             # story summary of this run (see pipeline.story_summary)
 
 
 def _norm(s: str) -> set[str]:
@@ -82,18 +89,23 @@ def dedup_events(items: list[MentionedEvent], tol_min: int) -> list[MentionedEve
     return out
 
 
-def build_report(now: datetime, mails: list[Email], insights: dict[str, MailInsight], events: list[Event],
+def build_report(now: datetime, threads: list[Thread], insights: dict[str, MailInsight], events: list[Event],
                  cfg, me: str, done_keys: set[str]) -> Report:
+    """insights: thread key -> analysis of the thread. One digest entry per thread, not per mail."""
     a = cfg
     rep = Report(generated=now)
     digest_from = now - timedelta(hours=a.digest_hours)
     look_from = now - timedelta(days=a.lookback_days)
     ahead_to = now + timedelta(days=a.lookahead_days)
     skip = {s.lower() for s in a.skip_senders}
-    mails = [m for m in mails if m.sender.lower() not in skip]
+    threads = [t for t in threads if t.key in insights and any(m.sender.lower() not in skip for m in t.mails)]
+    window = [t for t in threads if t.latest.received >= look_from]
 
-    # 1) Daily digest: mails in the digest window, sorted by priority then time.
-    rep.digest = [DigestEntry(m, insights[m.id]) for m in mails if m.received >= digest_from and m.id in insights]
+    # 1) Daily digest: threads with an inbox mail in the digest window, sorted by priority then time.
+    for t in threads:
+        inbox = [m for m in t.mails if m.folder == "inbox"]
+        if inbox and inbox[-1].received >= digest_from:
+            rep.digest.append(DigestEntry(inbox[-1], insights[t.key], t))
     rep.digest.sort(key=lambda d: (d.insight.priority, -d.mail.received.timestamp()))
 
     # 2) Calendar based checks.
@@ -112,9 +124,8 @@ def build_report(now: datetime, mails: list[Email], insights: dict[str, MailInsi
                            if now <= e.end and e.start <= ahead_to and not e.is_cancelled
                            and e.response_status != RESP_DECLINED]
 
-    # 3) Action items from mails in the lookback window.
-    window_mails = {m.id: m for m in mails if m.received >= look_from}
-    actions = dedup_actions([ai for mid in window_mails if mid in insights for ai in insights[mid].action_items])
+    # 3) Action items from threads in the lookback window.
+    actions = dedup_actions([ai for t in window for ai in insights[t.key].action_items])
     for ai in actions:
         if ai.owner == "other" or ai.key in done_keys or ai.due is None:
             continue
@@ -126,8 +137,7 @@ def build_report(now: datetime, mails: list[Email], insights: dict[str, MailInsi
             rep.upcoming.append(f)
 
     # 4) Events mentioned in mail but missing on the calendar.
-    mentioned = dedup_events([me_ for mid in window_mails if mid in insights for me_ in insights[mid].mentioned_events],
-                             a.event_match_minutes)
+    mentioned = dedup_events([me_ for t in window for me_ in insights[t.key].mentioned_events], a.event_match_minutes)
     for m in mentioned:
         if on_calendar(m, events, a.event_match_minutes):
             continue
@@ -140,24 +150,28 @@ def build_report(now: datetime, mails: list[Email], insights: dict[str, MailInsi
         elif now <= m.start <= ahead_to:
             rep.upcoming.append(f)
 
-    # 5) Mails that need a reply and are old enough.
+    # 5) Threads whose latest message needs my reply and is old enough. My reply in the thread ends it.
     reply_limit = now - timedelta(hours=a.reply_overdue_hours)
-    overdue_by_mail = {f.ref_id: f for f in rep.missed if f.kind == "overdue_action"}
-    for mid, m in window_mails.items():
-        ins = insights.get(mid)
-        if ins and ins.needs_reply and mid in overdue_by_mail:  # one entry per mail: merge into the action
-            overdue_by_mail[mid].detail += " · 회신 필요"
+    overdue = [f for f in rep.missed if f.kind == "overdue_action"]
+    for t in window:
+        ins, m = insights[t.key], t.latest
+        if not ins.needs_reply or is_mine(m, me):
             continue
-        if ins and ins.needs_reply and m.received <= reply_limit and (me.lower() in [t.lower() for t in m.to] or not me):
+        merged = next((f for f in overdue if f.ref_id in t.ids), None)
+        if merged:  # one entry per thread: merge into the overdue action
+            merged.detail += " · 회신 필요"
+            continue
+        if m.received <= reply_limit and (me.lower() in [x.lower() for x in m.to] or not me):
             rep.missed.append(Finding("overdue_reply", m.subject, m.received,
-                                      f"{m.sender_name or m.sender} — 회신 필요 ({ins.summary})", mid))
+                                      f"{m.sender_name or m.sender} — 회신 필요 ({ins.summary})", m.id))
 
     key = lambda f: f.when or now
     rep.missed.sort(key=key)
     rep.attention.sort(key=key)
     rep.upcoming.sort(key=key)
     rep.stats = {
-        "mails_total": len(mails), "digest": len(rep.digest), "missed": len(rep.missed),
+        "mails_total": sum(1 for t in threads for m in t.mails if m.folder == "inbox"),
+        "threads": len(threads), "digest": len(rep.digest), "missed": len(rep.missed),
         "attention": len(rep.attention), "upcoming_events": len(rep.upcoming_events),
         "upcoming_other": len(rep.upcoming),
         "llm_fallback": sum(1 for d in rep.digest if not d.insight.by_llm),

@@ -6,6 +6,10 @@
   mailbrief diagnose     classification failure analysis
   mailbrief done KEY     mark an action item as done
   mailbrief check-llm    test the LLM endpoint
+  mailbrief story ...    story tracker: review queue, promote/dismiss, edit (see story_cli.py)
+  mailbrief dashboard    write out/stories.html and the story folders again (no mail fetch)
+  mailbrief eval ...     export threads for labeling / score the labels (story classification accuracy)
+  mailbrief check-source what the mail source returns (collection path check)
 """
 from __future__ import annotations
 
@@ -53,6 +57,28 @@ def main(argv: list[str] | None = None) -> int:
     d.add_argument("key")
 
     sub.add_parser("check-llm", help="send a test prompt to the LLM endpoint")
+
+    from .story_cli import ACTIONS
+    sg = sub.add_parser("story", help="story tracker: review queue, promote/dismiss, edit")
+    sg.add_argument("action", nargs="?", default="list", choices=ACTIONS)
+    sg.add_argument("ids", nargs="*", help="S<n> for stories, R<n> for review items")
+    sg.add_argument("--owner")
+    sg.add_argument("--end", help="end condition: one sentence that says when the story is done")
+    sg.add_argument("--title")
+    sg.add_argument("--goal")
+    sg.add_argument("--into", help="promote: attach the review item to this story (S<n>)")
+    sg.add_argument("--key", help="unlink: thread key")
+
+    sub.add_parser("dashboard", help="write the story dashboard and folders again")
+
+    ev = sub.add_parser("eval", help="measure the story classification with real mail")
+    ev.add_argument("mode", choices=["export", "score"])
+    ev.add_argument("path", nargs="?", default="out/eval.csv")
+    ev.add_argument("--days", type=int, default=14)
+    ev.add_argument("--workers", type=int, default=2)
+
+    cs = sub.add_parser("check-source", help="check what the mail source returns")
+    cs.add_argument("--days", type=int, default=3)
 
     args = p.parse_args(argv)
     handlers: list[logging.Handler] = [logging.StreamHandler()] if sys.stderr else []  # pythonw has no console
@@ -110,6 +136,38 @@ def main(argv: list[str] | None = None) -> int:
 
         Store(expand(cfg.output.db_path)).set_action_status(args.key, "done")
         print(f"marked done: {args.key}")
+        return 0
+    if args.cmd == "story":
+        from .story_cli import story_command
+
+        return story_command(cfg, args.action, args.ids, owner=args.owner, end=args.end, title=args.title,
+                             goal=args.goal, into=args.into, key=args.key)
+    if args.cmd == "dashboard":
+        from zoneinfo import ZoneInfo
+
+        from .pipeline import make_tracker, write_story_views
+        from .store import Store
+
+        tr = make_tracker(cfg, Store(expand(cfg.output.db_path)))
+        if tr is None:
+            print("stories.enabled = false")
+            return 1
+        for k, v in write_story_views(cfg, tr, datetime.now(ZoneInfo(cfg.analysis.timezone))).items():
+            print(f"{k}: {v}")
+        return 0
+    if args.cmd == "eval":
+        from .evaluate import export_eval, format_score, read_csv, score
+
+        if args.mode == "export":
+            p = export_eval(cfg, args.path, args.days, workers=args.workers)
+            print(f"wrote {p}. Fill gold_route (story / review / none), then: mailbrief eval score {p}")
+        else:
+            print(format_score(score(read_csv(args.path))))
+        return 0
+    if args.cmd == "check-source":
+        from .evaluate import check_source
+
+        print(check_source(cfg, args.days))
         return 0
     if args.cmd == "check-llm":
         from .llm import OpenAICompatClient, parse_json

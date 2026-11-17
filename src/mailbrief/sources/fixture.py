@@ -18,7 +18,7 @@ class FixtureSource:
         self.tz = tz
         self.sent: list[tuple[str, str]] = []
 
-    def fetch_mails(self, since: datetime, limit: int) -> list[Email]:
+    def _mails(self, since: datetime, limit: int, folder: str) -> list[Email]:
         raw = json.loads((self.dir / "mails.json").read_text(encoding="utf-8"))
         out = []
         for m in raw:
@@ -26,9 +26,15 @@ class FixtureSource:
             m["received"] = _dt(m["received"])
             m["flag_due"] = _dt(m.get("flag_due"))
             e = Email(**m)
-            if e.received >= since:
+            if e.received >= since and e.folder == folder:
                 out.append(e)
         return sorted(out, key=lambda e: e.received, reverse=True)[:limit]
+
+    def fetch_mails(self, since: datetime, limit: int) -> list[Email]:
+        return self._mails(since, limit, "inbox")
+
+    def fetch_sent(self, since: datetime, limit: int) -> list[Email]:
+        return self._mails(since, limit, "sent")
 
     def fetch_events(self, start: datetime, end: datetime) -> list[Event]:
         raw = json.loads((self.dir / "events.json").read_text(encoding="utf-8"))

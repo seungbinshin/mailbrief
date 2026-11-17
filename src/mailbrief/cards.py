@@ -70,10 +70,18 @@ def build_cards(rep: Report) -> list[Card]:
     if rep.upcoming:
         cards.append(_cap(Card("마감 · 캘린더 미등록 일정", "#7c3aed"),
                           [CardItem(f.title, f"{_t(f.when)} · {f.detail}", _KIND.get(f.kind, f.kind)) for f in rep.upcoming]))
+    st = rep.stories
+    if st and (st.get("created") or st.get("updated") or st.get("review_new")):
+        items = [CardItem(title, f"{sid} · {subj}", "새 스토리") for sid, title, subj in st.get("created", [])]
+        items += [CardItem(title, f"{sid} · {subj}", "업데이트") for sid, title, subj in st.get("updated", [])]
+        items += [CardItem(subj, f"{rid} · {why}", "검토") for rid, subj, why in st.get("review_new", [])]
+        cards.append(_cap(Card("스토리", "#9333ea", stats=[("진행 중", st.get("active", 0)),
+                                                         ("검토 대기", st.get("review_open", 0))]), items))
     imp = [d for d in rep.digest if d.insight.priority <= 2 and d.insight.category not in ("newsletter",)]
     if imp:
         cards.append(_cap(Card("주요 메일", "#0891b2"),
-                          [CardItem(d.mail.subject, f"{d.mail.sender_name or d.mail.sender} · {d.insight.summary}",
+                          [CardItem(d.mail.subject + (f" ({d.count}통)" if d.count > 1 else ""),
+                                    f"{d.mail.sender_name or d.mail.sender} · {d.insight.summary}",
                                     _CAT.get(d.insight.category, d.insight.category)) for d in imp]))
     rest = [d for d in rep.digest if d not in imp]
     if rest:

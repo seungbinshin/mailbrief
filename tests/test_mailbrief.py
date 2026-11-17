@@ -59,7 +59,8 @@ def test_pipeline_with_llm(cfg):
 
     from pathlib import Path
     names = sorted(p.name for p in Path(cfg.output.dir).iterdir())
-    assert names == ["brief_20261117_0830.html", "brief_20261117_0830.md", "latest_cards.html", "latest_cards.json"]
+    assert names == ["brief_20261117_0830.html", "brief_20261117_0830.md", "latest_cards.html", "latest_cards.json",
+                     "stories.html"]
 
 
 def test_cache_prevents_second_llm_call(cfg):
@@ -83,10 +84,14 @@ def test_llm_failure_falls_back_to_rules(cfg):
     m1 = next(d for d in rep.digest if d.mail.id == "m1")
     assert m1.insight.by_llm is False and m1.insight.category == "action_required"
     assert rep.stats["llm_errors"] == 1
+    from mailbrief.extract import as_thread
     from mailbrief.pipeline import make_extractor
-    key = make_extractor(cfg, None, None).cache_key
-    assert Store(cfg.output.db_path).get_insight("m1", key) is None  # retried next run
-    assert Store(cfg.output.db_path).get_insight("m3", key) is not None
+    from mailbrief.sources.fixture import FixtureSource
+    ex = make_extractor(cfg, None, None)
+    mails = {m.id: m for m in FixtureSource(cfg.source, ZoneInfo("Asia/Seoul")).fetch_mails(datetime(2026, 11, 1, tzinfo=ZoneInfo("Asia/Seoul")), 50)}
+    db = Store(cfg.output.db_path)
+    assert db.get_insight(ex.store_key(as_thread(mails["m1"])), ex.cache_key) is None  # retried next run
+    assert db.get_insight(ex.store_key(as_thread(mails["m3"])), ex.cache_key) is not None
     assert [f["code"] for f in Store(cfg.output.db_path).failures()] == ["E_TRANSPORT"]
 
 
@@ -114,8 +119,10 @@ def test_overdue_reply_without_action(cfg):
     from mailbrief.models import MailInsight
     from mailbrief.analyze import build_report
     from mailbrief.sources.fixture import FixtureSource
+    from mailbrief.threads import group_threads
     src = FixtureSource(cfg.source, ZoneInfo("Asia/Seoul"))
-    mails = src.fetch_mails(datetime(2026, 11, 1, tzinfo=ZoneInfo("Asia/Seoul")), 50)
-    ins = {"m2": MailInsight("m2", "회신 요청", "action_required", 2, True)}
-    rep = build_report(NOW, mails, ins, [], cfg.analysis, "me@corp.com", set())
+    threads = group_threads(src.fetch_mails(datetime(2026, 11, 1, tzinfo=ZoneInfo("Asia/Seoul")), 50), "me@corp.com")
+    t2 = next(t for t in threads if "m2" in t.ids)
+    ins = {t2.key: MailInsight("m2", "회신 요청", "action_required", 2, True)}
+    rep = build_report(NOW, threads, ins, [], cfg.analysis, "me@corp.com", set())
     assert kinds(rep.missed) == [("overdue_reply", "m2")]

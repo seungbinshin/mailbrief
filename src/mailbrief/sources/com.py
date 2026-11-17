@@ -10,7 +10,8 @@ from datetime import datetime, timedelta
 from ..models import (RESP_ACCEPTED, RESP_DECLINED, RESP_NONE, RESP_NOT_RESPONDED, RESP_ORGANIZER,
                       RESP_TENTATIVE, Email, Event)
 
-OL_INBOX, OL_CALENDAR = 6, 9
+OL_SENT, OL_INBOX, OL_CALENDAR = 5, 6, 9
+PR_INTERNET_MESSAGE_ID = "http://schemas.microsoft.com/mapi/proptag/0x1035001F"
 OL_MAIL, OL_MEETING_REQUEST = 43, 53
 # OlResponseStatus enumeration
 _RESP = {0: RESP_NONE, 1: RESP_ORGANIZER, 2: RESP_TENTATIVE, 3: RESP_ACCEPTED, 4: RESP_DECLINED,
@@ -36,48 +37,71 @@ class OutlookCOMSource:
         d = datetime(d.year, d.month, d.day, d.hour, d.minute, d.second)
         return d.replace(tzinfo=self.tz)  # pywin32 returns local wall time
 
-    def fetch_mails(self, since: datetime, limit: int) -> list[Email]:
-        items = self.ns.GetDefaultFolder(OL_INBOX).Items
-        items.Sort("[ReceivedTime]", True)
-        items = items.Restrict(f"[ReceivedTime] >= '{_filter_dt(since)}'")
+    def _smtp(self, entry, fallback: str) -> str:
+        try:
+            if entry.Type == "EX":  # Exchange DN -> SMTP
+                u = entry.GetExchangeUser()
+                return u.PrimarySmtpAddress if u else fallback
+        except Exception:
+            pass
+        return fallback
+
+    def _to_email(self, it, folder: str) -> Email:
+        try:
+            sender = it.SenderEmailAddress
+            if it.SenderEmailType == "EX":
+                sender = self._smtp(it.Sender, sender)
+        except Exception:
+            sender = ""
+        if folder == "sent" and not sender:
+            sender = self.cfg.my_address
+        to, cc = [], []
+        for r in it.Recipients:
+            addr = r.Address
+            try:
+                addr = self._smtp(r.AddressEntry, addr)
+            except Exception:
+                pass
+            (to if r.Type == 1 else cc).append(addr)
+        due = None
+        try:
+            if it.IsMarkedAsTask and it.TaskDueDate and it.TaskDueDate.year < 4500:
+                due = self._aware(it.TaskDueDate).replace(hour=18, minute=0)
+        except Exception:
+            pass
+        mid = ""
+        try:
+            mid = it.PropertyAccessor.GetProperty(PR_INTERNET_MESSAGE_ID) or ""
+        except Exception:
+            pass
+        when = it.SentOn if folder == "sent" else it.ReceivedTime
+        return Email(
+            id=it.EntryID, subject=it.Subject or "", sender=sender, sender_name=it.SenderName or "",
+            received=self._aware(when), body_text=it.Body or "", to=to, cc=cc,
+            is_read=folder == "sent" or not it.UnRead, importance=_IMPORTANCE.get(it.Importance, "normal"),
+            conversation_id=getattr(it, "ConversationID", "") or "",
+            has_attachments=it.Attachments.Count > 0, flag_due=due,
+            is_meeting_request=it.Class == OL_MEETING_REQUEST, message_id=str(mid), folder=folder,
+        )
+
+    def _fetch(self, folder_id: int, field: str, folder: str, since: datetime, limit: int) -> list[Email]:
+        items = self.ns.GetDefaultFolder(folder_id).Items
+        items.Sort(f"[{field}]", True)
+        items = items.Restrict(f"[{field}] >= '{_filter_dt(since)}'")
         out = []
         for it in items:
             if len(out) >= limit:
                 break
             if it.Class not in (OL_MAIL, OL_MEETING_REQUEST):
                 continue
-            try:
-                sender = it.SenderEmailAddress
-                if it.SenderEmailType == "EX":  # Exchange DN -> SMTP
-                    ex = it.Sender.GetExchangeUser()
-                    sender = ex.PrimarySmtpAddress if ex else sender
-            except Exception:
-                sender = ""
-            to, cc = [], []
-            for r in it.Recipients:
-                addr = r.Address
-                try:
-                    if r.AddressEntry.Type == "EX":
-                        u = r.AddressEntry.GetExchangeUser()
-                        addr = u.PrimarySmtpAddress if u else addr
-                except Exception:
-                    pass
-                (to if r.Type == 1 else cc).append(addr)
-            due = None
-            try:
-                if it.IsMarkedAsTask and it.TaskDueDate and it.TaskDueDate.year < 4500:
-                    due = self._aware(it.TaskDueDate).replace(hour=18, minute=0)
-            except Exception:
-                pass
-            out.append(Email(
-                id=it.EntryID, subject=it.Subject or "", sender=sender, sender_name=it.SenderName or "",
-                received=self._aware(it.ReceivedTime), body_text=it.Body or "", to=to, cc=cc,
-                is_read=not it.UnRead, importance=_IMPORTANCE.get(it.Importance, "normal"),
-                conversation_id=getattr(it, "ConversationID", "") or "",
-                has_attachments=it.Attachments.Count > 0, flag_due=due,
-                is_meeting_request=it.Class == OL_MEETING_REQUEST,
-            ))
+            out.append(self._to_email(it, folder))
         return out
+
+    def fetch_mails(self, since: datetime, limit: int) -> list[Email]:
+        return self._fetch(OL_INBOX, "ReceivedTime", "inbox", since, limit)
+
+    def fetch_sent(self, since: datetime, limit: int) -> list[Email]:
+        return self._fetch(OL_SENT, "SentOn", "sent", since, limit)
 
     def fetch_events(self, start: datetime, end: datetime) -> list[Event]:
         items = self.ns.GetDefaultFolder(OL_CALENDAR).Items

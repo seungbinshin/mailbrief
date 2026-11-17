@@ -28,32 +28,41 @@ class EWSSource:
             self.account = Account(cfg.email, credentials=creds, autodiscover=True, access_type=DELEGATE,
                                    default_timezone=self.ews_tz)
 
-    def fetch_mails(self, since: datetime, limit: int) -> list[Email]:
+    def _fetch(self, folder, field: str, kind: str, since: datetime, limit: int) -> list[Email]:
         from exchangelib import EWSDateTime
 
-        qs = (self.account.inbox.filter(datetime_received__gte=EWSDateTime.from_datetime(since))
-              .order_by("-datetime_received")
+        qs = (folder.filter(**{f"{field}__gte": EWSDateTime.from_datetime(since)})
+              .order_by(f"-{field}")
               .only("id", "subject", "sender", "to_recipients", "cc_recipients", "datetime_received",
-                    "text_body", "body", "is_read", "importance", "conversation_id", "has_attachments",
-                    "item_class"))
+                    "datetime_sent", "text_body", "body", "is_read", "importance", "conversation_id",
+                    "has_attachments", "item_class", "message_id"))
         out = []
         for m in qs[:limit]:
+            when = (m.datetime_sent if kind == "sent" else m.datetime_received) or m.datetime_received
             out.append(Email(
                 id=m.id,
                 subject=m.subject or "",
-                sender=m.sender.email_address if m.sender else "",
+                sender=m.sender.email_address if m.sender else (self.cfg.my_address if kind == "sent" else ""),
                 sender_name=m.sender.name if m.sender else "",
-                received=m.datetime_received.astimezone(self.tz),
+                received=when.astimezone(self.tz),
                 body_text=m.text_body or str(m.body or ""),
                 to=[r.email_address for r in (m.to_recipients or [])],
                 cc=[r.email_address for r in (m.cc_recipients or [])],
-                is_read=bool(m.is_read),
+                is_read=kind == "sent" or bool(m.is_read),
                 importance=(m.importance or "Normal").lower(),
                 conversation_id=m.conversation_id.id if m.conversation_id else "",
                 has_attachments=bool(m.has_attachments),
                 is_meeting_request=(getattr(m, "item_class", "") or "").startswith("IPM.Schedule.Meeting.Request"),
+                message_id=getattr(m, "message_id", "") or "",
+                folder=kind,
             ))
         return out
+
+    def fetch_mails(self, since: datetime, limit: int) -> list[Email]:
+        return self._fetch(self.account.inbox, "datetime_received", "inbox", since, limit)
+
+    def fetch_sent(self, since: datetime, limit: int) -> list[Email]:
+        return self._fetch(self.account.sent, "datetime_sent", "sent", since, limit)
 
     def fetch_events(self, start: datetime, end: datetime) -> list[Event]:
         from exchangelib import EWSDateTime

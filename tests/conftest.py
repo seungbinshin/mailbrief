@@ -47,6 +47,7 @@ class FakeLLM:
         self.calls += 1
         if not json_output:
             return "- 오늘 Daily standup 10:00 참석\n- 설계 리뷰 의견 회신이 지연됨\n- Q4 MPE 리포트 마감 11/18"
+        user = user.split("\nOPEN STORIES")[0]  # match on the thread only, not on the open story list
         if self.fail_on and self.fail_on in user:
             raise LLMError("simulated failure")
         for k, v in CANNED.items():
