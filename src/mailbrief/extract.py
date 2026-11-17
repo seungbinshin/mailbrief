@@ -24,7 +24,7 @@ from .llm import E_BAD_JSON, E_CONTEXT, E_EMPTY, E_NO_JSON, E_SCHEMA, E_TRUNCATE
 from .models import ActionItem, Email, MailInsight, MentionedEvent, StoryVerdict, Thread
 from .preprocess import clean_body
 from .prompts import MESSAGE, OPEN_STORIES_HEAD, PROMPT_VERSION, THREAD_HEAD, extract_system
-from .threads import is_mine, normalize_subject, subject_key
+from .threads import is_mine, mail_key, normalize_subject
 
 log = logging.getLogger(__name__)
 
@@ -136,14 +136,22 @@ class Normalizer:
             return 2
 
     def confidence(self, v) -> float:
+        """high/medium/low or 0..1 or percent. Booleans and small integers (1..5 scales) are not clear -> 0."""
         if v is None:
             return 0.0
         if isinstance(v, str) and v.strip().lower() in _CONF_WORDS:
             return _CONF_WORDS[v.strip().lower()]
+        if isinstance(v, bool):
+            self.warnings.append(f"bad story confidence {v!r} -> 0")
+            return 0.0
         try:
             f = float(v)
         except (TypeError, ValueError):
             self.warnings.append(f"bad story confidence {v!r} -> 0")
+            return 0.0
+        is_int = isinstance(v, int) or (isinstance(v, str) and v.strip().isdigit())
+        if is_int and 1 <= f <= 5:
+            self.warnings.append(f"ambiguous story confidence {v!r} -> 0")
             return 0.0
         if 1 < f <= 100:  # percent
             f /= 100
@@ -185,8 +193,7 @@ def _as_list(v) -> list:
 def as_thread(x: Email | Thread) -> Thread:
     if isinstance(x, Thread):
         return x
-    key = f"c:{x.conversation_id}" if x.conversation_id else (
-        subject_key(x.subject) if normalize_subject(x.subject) else f"m:{x.id}")
+    key = f"c:{x.conversation_id}" if x.conversation_id else mail_key(x)
     return Thread(key=key, subject=normalize_subject(x.subject) or x.subject, mails=[x], keys={key})
 
 

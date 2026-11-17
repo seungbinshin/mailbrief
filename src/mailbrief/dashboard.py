@@ -95,14 +95,23 @@ def _review_md(item: ReviewItem, tz: ZoneInfo) -> str:
     ]) + "\n"
 
 
+def _head(p: Path, n: int = 64) -> bytes:
+    """First bytes of a file, or b"" if it cannot be read. Files in the export folder can be the user's own
+    (any encoding, locked by an editor): never fail on them."""
+    try:
+        with open(p, "rb") as f:
+            return f.read(n)
+    except OSError:
+        return b""
+
+
 def _find_story_dir(root: Path, sid: str) -> Path | None:
     for sub in STATUS_DIR.values():
         d = root / sub
         if not d.is_dir():
             continue
         for p in d.iterdir():
-            m = p / ".mailbrief"
-            if p.is_dir() and m.is_file() and m.read_text(encoding="utf-8").strip() == sid:
+            if p.is_dir() and _head(p / ".mailbrief").decode("utf-8", "ignore").strip() == sid:
                 return p
     return None
 
@@ -128,8 +137,11 @@ def export_folders(tr: StoryTracker, root: str | Path, tz: ZoneInfo) -> Path:
     items = tr.open_reviews()
     keep = {f"{i.rid} {safe_name(i.subject, fallback='제목 없음')}.md" for i in items}
     for p in rv.glob("*.md"):
-        if p.name not in keep and p.read_text(encoding="utf-8").startswith(MARK):
-            p.unlink()  # closed review item; only generated files are removed
+        if p.name not in keep and _head(p).startswith(MARK.encode()):
+            try:
+                p.unlink()  # closed review item; only generated files are removed
+            except OSError:
+                pass
     for i in items:
         (rv / f"{i.rid} {safe_name(i.subject, fallback='제목 없음')}.md").write_text(_review_md(i, tz), encoding="utf-8")
 

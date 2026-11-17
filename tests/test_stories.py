@@ -58,8 +58,6 @@ def test_re_chain_is_one_thread_and_one_llm_call(scfg):
     assert llm.calls == 9 + 1
     mpe = next(d for d in rep.digest if "Q4 MPE" in d.mail.subject)
     assert mpe.count == 3 and mpe.mail.id == "s3"           # thread with my sent reply, shown once
-    weekly = [d for d in rep.digest if "주간 보고" in d.mail.subject]
-    assert weekly == [] or weekly[0].count == 3            # no conversation id: joined by subject + participant
     _, threads = fetch_threads(scfg, src, NOW - timedelta(days=7))
     assert sorted(len(x.mails) for x in threads if "주간 보고" in x.subject) == [3]
     assert [x.ids for x in threads if x.subject == "팀 회의록 공유"] == [["c1"]]   # inbox copy kept
@@ -79,15 +77,31 @@ def test_sent_only_thread_is_not_analyzed():
 
 
 def test_my_reply_ends_needs_reply(scfg):
-    src = ListSource([
-        mail("q1", "설계 리뷰 자료 회신 부탁", "lee@corp.com", t(12, 9), "의견 부탁드립니다.", conv="cq"),
-        mail("q2", "RE: 설계 리뷰 자료 회신 부탁", ME, t(13, 9), "의견 드립니다.", to=("lee@corp.com",), conv="cq",
-             folder="sent"),
-    ])
-    rep = _run(scfg, src, StoryLLM())
-    assert all(f.kind != "overdue_reply" for f in rep.missed)
-    d = next(iter(rep.digest), None)
-    assert d is None or d.insight.needs_reply is False
+    q1 = mail("q1", "설계 리뷰 자료 회신 부탁", "lee@corp.com", t(12, 9), "의견 부탁드립니다.", conv="cq")
+    q2 = mail("q2", "RE: 설계 리뷰 자료 회신 부탁", ME, t(13, 7), "의견 드립니다.", to=("lee@corp.com",), conv="cq",
+              folder="sent")
+    scfg.analysis.reply_overdue_hours = 1
+    rep = _run(scfg, ListSource([q1]), StoryLLM(), now=t(13, 8))                 # without my reply
+    assert rep.digest[0].insight.needs_reply is True and "overdue_reply" in [f.kind for f in rep.missed]
+    rep = _run(scfg, ListSource([q1, q2]), StoryLLM(), now=t(13, 8))             # my reply is the latest mail
+    assert rep.digest[0].count == 2 and rep.digest[0].insight.needs_reply is False
+    assert "overdue_reply" not in [f.kind for f in rep.missed]
+
+
+def test_conversations_with_ids_are_not_joined_by_subject():
+    a = mail("y1", "견적 요청", "sales@vendor-a.com", t(14, 9), "견적", to=("team@corp.com",), conv="cv-a")
+    b = mail("y2", "견적 요청", "sales@vendor-b.com", t(15, 9), "견적", to=("team@corp.com",), conv="cv-b")
+    assert len(group_threads([a, b], "")) == 2
+
+
+def test_revision_is_stable_when_old_mails_leave_the_window(scfg):
+    src, llm = ListSource(base_mails()), StoryLLM()
+    _run(scfg, src, llm)
+    calls = llm.calls
+    _run(scfg, src, llm, now=t(19, 10))       # s1 (11/12 09:00) is now outside the 7-day window; no new mail
+    assert not any("Q4 MPE" in u.split("OPEN STORIES")[0] for u in llm.users[calls - 1:])
+    tr = _tracker(scfg)
+    assert len(tr.updates(tr.stories()[0].id)) == 1
 
 
 # ---------------------------------------------------------------- judge: not sure -> review, never story
@@ -105,6 +119,14 @@ def test_judge_table(cat, story, route, reasons):
     th = group_threads([mail("j1", "제목", "x@corp.com", NOW, "본문")], ME)[0]
     v = judge(th, MailInsight("j1", "s", cat, 2, False, story=story), StoryConfig(), ME)
     assert (v.route, v.reasons) == (route, reasons)
+
+
+@pytest.mark.parametrize("raw,val", [("high", 0.9), (0.85, 0.85), (90, 0.9), (1, 0.0), (True, 0.0), ("3", 0.0),
+                                     (None, 0.0)])
+def test_confidence_scale(raw, val):
+    from mailbrief.extract import Normalizer
+    from mailbrief.config import DEFAULT_CATEGORIES
+    assert Normalizer(dict(DEFAULT_CATEGORIES)).confidence(raw) == val
 
 
 def test_automatic_sender_is_noise():
@@ -215,6 +237,29 @@ def test_dismissed_thread_stays_out_until_a_clear_story(scfg):
     _run(scfg, src, llm, now=t(17, 12))
     again = tr.review(item.rid)
     assert again.status == "open" and again.reasons == ["reopened"]   # a clear story: ask again, do not auto-create
+    _run(scfg, src, llm, now=t(17, 13))                     # next run, no user action: still a question
+    assert tr.review(item.rid).status == "open" and "협력사 샘플 평가" not in [s.title for s in tr.stories()]
+
+
+def test_dismissed_thread_is_not_attached_by_llm_match(scfg):
+    from story_fixture import CANNED, ans, st
+    src, llm = ListSource(base_mails()), StoryLLM()
+    added = [("예약 확정", ans("장비 예약 확정.", "fyi", st(False, None, None, "low", match="S1"))),
+             ("추가 작업 문의", ans("장비 추가 작업 문의.", "fyi", st(True, None, None, "medium")))]
+    CANNED[0:0] = added
+    try:
+        _run(scfg, src, llm)                                # S1 exists now
+        src.mails.append(mail("e0", "장비 사용 문의", "park@corp.com", t(17, 9), "추가 작업 문의입니다.", conv="conv-eq"))
+        _run(scfg, src, llm, now=t(17, 10))
+        tr = _tracker(scfg)
+        item = next(i for i in tr.open_reviews() if i.subject == "장비 사용 문의")
+        tr.dismiss(item.rid, NOW)
+        src.mails.append(mail("e1", "RE: 장비 사용 문의", "park@corp.com", t(17, 11), "예약 확정입니다.", conv="conv-eq"))
+        _run(scfg, src, llm, now=t(17, 12))                 # LLM says "match S1", but the user dismissed this thread
+        assert "c:conv-eq" not in [l["key"] for l in tr.links(tr.stories()[0].id)]
+        assert tr.review(item.rid).status == "dismissed"
+    finally:
+        del CANNED[0:2]
 
 
 def test_llm_match_attaches_to_open_story_and_bad_match_is_ignored(scfg):
@@ -228,6 +273,31 @@ def test_llm_match_attaches_to_open_story_and_bad_match_is_ignored(scfg):
     assert "OPEN STORIES" in llm.users[-1] and "S1: Q4 MPE 검증" in llm.users[-1]
     assert [u["email_id"] for u in tr.updates(st.id)][0] == "e1"
     assert "c:conv-equip" in [l["key"] for l in tr.links(st.id)]
+    assert tr.unlink(st.sid, "c:conv-equip") == 1
+    _run(scfg, src, llm, now=t(17, 11))                     # cached match must not attach it again
+    assert "c:conv-equip" not in [l["key"] for l in tr.links(st.id)]
+
+
+def test_same_generic_subject_later_is_another_thread(scfg):
+    tr = _tracker(scfg)
+    st_ = tr.new("자료 정리", NOW, owner="me", end="자료 제출 시 종료")
+    k1 = mail("k1", "자료 요청", "kim@corp.com", t(10, 9), "자료 부탁")
+    kim = group_threads([k1], ME)[0]
+    tr._link(st_.id, sorted(kim.keys), "new", "2026-11-10T00:00:00+00:00", kim)
+    hr = group_threads([mail("h9", "자료 요청", "hr@corp.com", t(17, 9), "교육 자료")], ME)[0]
+    assert hr.key != kim.key and tr.linked_story(hr) is None       # same subject, other thread: no attach
+    k2 = mail("k2", "RE: 자료 요청", "kim@corp.com", t(12, 9), "추가 자료")
+    both = group_threads([k1, k2], ME)[0]
+    assert len(both.mails) == 2 and tr.linked_story(both).id == st_.id   # shares mail k1: same thread
+
+
+def test_promote_twice_is_refused(scfg):
+    _run(scfg, ListSource(base_mails()), StoryLLM())
+    tr = _tracker(scfg)
+    rid = tr.open_reviews()[0].rid
+    tr.promote(rid, NOW, owner="me", end="끝나면 종료")
+    with pytest.raises(ValueError):
+        tr.promote(rid, NOW)
 
 
 def test_end_reached_needs_confirmation_not_auto_close(scfg):
@@ -271,8 +341,10 @@ def test_export_moves_folder_and_keeps_user_files(scfg, tmp_path):
     assert not d.exists() and (root / "done" / "S1 Q4-MPE 검증" / "memo.txt").read_text(encoding="utf-8") == "내 메모"
     assert len(list((root / "review").glob("*.md"))) == 1
     (root / "review" / "my note.md").write_text("손으로 쓴 파일", encoding="utf-8")
+    (root / "review" / "old memo.md").write_bytes("메모장 cp949 파일".encode("cp949"))
     export_folders(tr, root, TZ)
     assert (root / "review" / "my note.md").exists()       # not generated -> never removed
+    assert (root / "review" / "old memo.md").exists()      # not UTF-8: no crash, not removed
 
 
 # ---------------------------------------------------------------- accuracy measurement and source check
@@ -284,6 +356,7 @@ def test_eval_export_and_score(scfg, tmp_path):
     tr = make_tracker(scfg, store)
     insights, _ = analyze_threads(scfg, threads, StoryLLM(), store)
     rows = predict_rows(scfg, threads, insights, tr, ME)
+    assert tr.stories() == [] and tr.open_reviews() == []  # export does not change the tracker
     gold = {"Q4 MPE": "story", "협력사 샘플": "스토리", "시스템 이관": "story", "Newsletter": "아님"}
     for r in rows:
         r["gold_route"] = next((g for k, g in gold.items() if k in r["subject"]), "none")
@@ -292,7 +365,19 @@ def test_eval_export_and_score(scfg, tmp_path):
     assert s["labeled"] == 9 and s["story_precision"] == 1.0 and s["story_caught"] == 1.0
     assert s["confusion"]["story"] == {"story": 1, "review": 2}
     assert "스토리 정밀도" in format_score(s)
-    assert tr.stories() == []                               # export does not change the tracker
+
+
+def test_eval_uses_the_tracker_decision(scfg):
+    src, llm = ListSource(base_mails()), StoryLLM()
+    _run(scfg, src, llm)
+    src.mails.append(mail("e1", "MPE 측정 장비 예약", "park@corp.com", t(17, 9), "장비 예약 완료.", conv="conv-equip"))
+    store = Store(scfg.output.db_path)
+    tr = make_tracker(scfg, store)
+    _, threads = fetch_threads(scfg, src, t(17, 10) - timedelta(days=7))
+    insights, _ = analyze_threads(scfg, threads, llm, store, open_stories=tr.prompt_stories())
+    rows = {r["subject"]: r for r in predict_rows(scfg, threads, insights, tr, ME)}
+    assert rows["MPE 측정 장비 예약"]["pred_route"] == "story" and rows["MPE 측정 장비 예약"]["linked_story"] == "S1"
+    assert rows["Q4 MPE 검증 진행 요청"]["linked_story"] == "S1"
 
 
 def test_check_source_reports_threads_and_copies(scfg):

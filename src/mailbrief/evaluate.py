@@ -38,16 +38,20 @@ def predict_rows(cfg: Config, threads: list[Thread], insights: dict[str, MailIns
         ins = insights.get(t.key)
         if ins is None:
             continue
-        v = judge(t, ins, cfg.stories, me)
-        linked = tracker.linked_story(t) if tracker else None
+        if tracker:  # the same decision as `run` (linked thread, LLM match, then rules), without writing
+            p = tracker.plan(t, ins)
+            route, reasons, linked = p.route, p.reasons, (p.story if p.action == "attach" else None)
+        else:
+            v = judge(t, ins, cfg.stories, me)
+            route, reasons, linked = (v.route if ins.by_llm else "pending"), v.reasons, None
         s = ins.story
         rows.append({
             "thread_key": t.key, "latest": t.latest.received.astimezone(tz).strftime("%Y-%m-%d %H:%M"),
             "messages": len(t.mails), "subject": t.subject,
             "senders": ", ".join(sorted({m.sender_name or m.sender for m in t.mails}))[:120],
             "category": ins.category, "meeting_type": ins.meeting_type,
-            "pred_route": v.route if ins.by_llm else "pending",
-            "reasons": ", ".join(reason_ko(r) for r in v.reasons) or (f"LLM 실패 {ins.fail_code}" if not ins.by_llm else ""),
+            "pred_route": route,
+            "reasons": ", ".join(reason_ko(r) for r in reasons) or (f"LLM 실패 {ins.fail_code}" if not ins.by_llm else ""),
             "linked_story": linked.sid if linked else "", "story_title": s.title, "owner": s.owner,
             "end_condition": s.end_condition, "confidence": f"{s.confidence:.1f}", "summary": ins.summary,
             "gold_route": "", "gold_category": "", "note": "",

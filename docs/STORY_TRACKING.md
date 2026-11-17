@@ -17,7 +17,7 @@ Story-tracker 에는 메일을 읽는 앞쪽이 없었습니다. 두 부분을 �
 Outlook(받은편지함 + 보낸편지함)
    │  사본 제거(Message-ID), 스레드 묶기(conversation_id → 제목+참여자)
    ▼
-스레드 1개 = LLM 호출 1회 (새 회신이 오면 새 리비전 → 1회 더)
+스레드 1개 = LLM 호출 1회 (새 메일이 오면 새 리비전 → 1회 더. 옛 메일이 수집 기간에서 빠져도 호출 없음)
    │  요약, 분류, 할 일, 일정, 회의 종류, 스토리 사실(지속성, 담당, 종결 조건, 확신도, 매칭 후보)
    ▼
 규칙 판정 (stories.judge)  ──→  story  : 연결된 스토리에 추가, 또는 새 스토리
@@ -50,7 +50,7 @@ LLM 은 사실만 냅니다. 판정은 코드의 규칙이 합니다(`stories.ju
 |---|---|---|---|
 | 1 | LLM 실패(규칙 대체 결과) | pending. 판정하지 않음. 캐시하지 않으므로 다음 실행에서 다시 시도 | — |
 | 2 | 이미 스토리에 연결된 스레드 | 그 스토리에 업데이트 추가 | — |
-| 3 | LLM 이 열린 스토리 S 와 같은 목표라고 함(`story.match`), 공지·자동 메일 아님 | S 에 업데이트 추가 | — |
+| 3 | LLM 이 열린 스토리 S 와 같은 목표라고 함(`story.match`), 공지·자동 메일 아님, 사용자가 제외·연결 해제하지 않음 | S 에 업데이트 추가 | — |
 | 4 | 지속성 없음 | none | — |
 | 5 | 지속성 있음 + 공지/뉴스레터 분류 또는 자동 발신 | review | `category_conflict` |
 | 6 | 지속성 있음 + 담당 없음 | review | `owner_unknown` |
@@ -63,6 +63,8 @@ LLM 은 사실만 냅니다. 판정은 코드의 규칙이 합니다(`stories.ju
 - **애매하면 스토리가 아닙니다.** 조건이 하나라도 없거나 확신이 낮으면 검토 대기로 갑니다.
 - **공지 안의 실제 업무는 조용히 사라지지 않습니다.** 공지 분류에 지속성이 있으면 검토 대기로 갑니다(5번).
 - 사람이 "스토리 아님"으로 처리한 스레드는 다시 올라오지 않습니다. 단, 나중 메일에서 3가지 조건이 모두 분명해지면 검토 대기에 다시 올립니다(`reopened`). 자동으로 스토리를 만들지 않습니다.
+- 사람이 "스토리 아님"으로 처리한 스레드는 LLM 매칭으로도 스토리에 붙지 않습니다. 다시 묻는 항목(`reopened`)도 사람이 답할 때까지 검토 대기에 남습니다.
+- `story unlink` 로 뺀 스레드는 그 스토리에 다시 붙지 않습니다(캐시된 LLM 매칭 포함). `story promote R --into S` 로 사람이 다시 붙일 수 있습니다.
 - 종결 조건 충족 신호(`story.done`)가 오면 자동으로 닫지 않습니다. `end_reached` 사유로 검토 대기에 올립니다. 사람이 `story close` 로 닫습니다.
 
 ## 4. 사내 실측 문제와 조치
@@ -77,8 +79,8 @@ LLM 은 사실만 냅니다. 판정은 코드의 규칙이 합니다(`stories.ju
 | 담당자 확정 후에도 리뷰 대기가 풀리지 않음 | 리뷰 상태를 플래그로 저장 | 검토 사유를 매번 계산(담당·종결 조건이 비었는지). 값을 넣으면 바로 풀림. 열린 검토 항목은 나중 메일로 조건이 채워지면 자동으로 스토리가 됨 | `test_review_clears_when_owner_and_end_are_set`, `test_open_review_is_promoted_when_a_later_mail_makes_it_clear` |
 | 폴더명에 슬래시 포함 | 제목을 그대로 사용 | `safe_name`: `\ / : * ? " < > |`, 제어 문자, 끝의 점·공백, Windows 예약어(CON, NUL …), `..` 를 처리. 폴더명 앞에 ID(`S3`)를 붙여 중복 없음 | `test_safe_name` |
 | 회의 종류를 제목으로만 판정 | 제목 규칙 | LLM 이 본문, 초대 여부(MEETING REQUEST), 참석자, 안건으로 판정(`meeting_type`). 종류는 설정에서 바꿈 | 프롬프트 규칙 |
-| RE: 메일이 각각 다른 메일로 판정 | 메일 1통 단위 처리 | 스레드 단위 처리. conversation_id → 제목(RE:/FW:/회신:/전달: 제거) + 공통 참여자 + 14일 이내 | `test_re_chain_is_one_thread_and_one_llm_call`, `test_normalize_subject` |
-| 메일 1통마다 LLM 호출 | 메일 단위 | 스레드 리비전 1개 = 호출 1회. 새 메일이 없으면 캐시 사용(호출 0회) | 위와 같음 |
+| RE: 메일이 각각 다른 메일로 판정 | 메일 1통 단위 처리 | 스레드 단위 처리. conversation_id → (한쪽에 conversation_id 가 없을 때만) 제목(RE:/FW:/회신:/전달: 제거) + 공통 참여자 + 14일 이내. 서로 다른 Outlook 대화는 제목으로 합치지 않음 | `test_re_chain_is_one_thread_and_one_llm_call`, `test_normalize_subject`, `test_conversations_with_ids_are_not_joined_by_subject` |
+| 메일 1통마다 LLM 호출 | 메일 단위 | 리비전 = 스레드의 최신 메일(Message-ID). 새 메일이 없으면 캐시 사용(호출 0회). 옛 메일이 기간에서 빠져도 다시 호출하지 않음 | `test_revision_is_stable_when_old_mails_leave_the_window` |
 
 ## 5. 검토 대기 처리
 
@@ -200,12 +202,14 @@ max_tokens = 1536        # 스토리 키가 추가되어 출력이 길어짐. 10
 |---|---|---|
 | `insights` | (`thr:<리비전>`, 모델\|프롬프트 버전\|분류\|회의 종류) | 스레드 분석 캐시 |
 | `stories` | `id` (표시 `S<id>`) | 제목, 목표, 담당, 종결 조건, 상태(active/done/merged), 플래그, 병합 대상, 생성·활동 시각 |
-| `story_links` | 스레드 키(`c:<conversation id>` 또는 `s:<제목 해시>`) | 스토리 ID, 연결 방법(new/match/promote/thread), 마지막 활동 |
+| `story_links` | 스레드 키(`c:<conversation id>` 또는 `s:<제목 해시>:<메일 해시>`) | 스토리 ID, 연결 방법(new/match/promote/thread), 마지막 활동, 참여자 |
+| `story_blocks` | (스레드 키, 스토리 ID) | `story unlink` 기록. 이 스레드는 이 스토리에 자동으로 붙지 않음 |
 | `story_updates` | `id`, UNIQUE(스토리, 내용 해시) | 스레드 키, 리비전, 메일 ID, 제목, 요약, 원본 시각, 캡처 시각 |
-| `reviews` | `id` (표시 `R<id>`), UNIQUE(스레드 키) | 스레드 키 목록, 리비전, 요약, 분류, 사유, 제안(제목·목표·담당·종결 조건), 상태(open/promoted/dismissed) |
+| `reviews` | `id` (표시 `R<id>`), UNIQUE(스레드 키) | 스레드 키 목록, 리비전, 요약, 분류, 사유, 제안(제목·목표·담당·종결 조건), 참여자, 상태(open/promoted/dismissed) |
 
 검토 사유 중 `owner_unknown`, `end_unknown` 은 저장하지 않습니다. 매번 계산합니다.
-제목만으로 만든 연결(`s:`)은 약합니다. 마지막 활동 후 `link_gap_days`(기본 14일)가 지나면 자동으로 붙지 않습니다.
+conversation_id 가 없는 스레드의 키(`s:`)에는 메일 1통의 해시가 들어갑니다. 그래서 같은 제목의 다른 스레드("자료 요청")와 키가 겹치지 않습니다.
+스레드는 모든 메일의 키를 가집니다. 옛 메일이 수집 기간에서 빠져도 남은 메일의 키로 스토리 연결이 유지됩니다. `s:` 연결은 공통 참여자도 확인합니다.
 
 ## 11. 설정
 
@@ -221,6 +225,5 @@ max_tokens = 1536        # 스토리 키가 추가되어 출력이 길어짐. 10
 | `stories.auto_sender_patterns` | noreply, notification … | 자동 발신자(정규식, @ 앞부분) |
 | `stories.prompt_stories` | 30 | 매칭을 위해 LLM 에 보여 주는 열린 스토리 수 |
 | `stories.duplicate_similarity` | 0.6 | 새 스토리와 기존 스토리의 제목 유사도 기준 |
-| `stories.link_gap_days` | 14 | 제목 연결의 유효 기간 |
 | `stories.export_dir` | "" | 스토리 폴더 경로(빈 값 = 끔) |
 | `output.dashboard` | true | `out/stories.html` 생성 |

@@ -82,7 +82,6 @@ auto_sender_patterns = ["^no-?reply", "^do-?not-?reply", "^mailer-daemon", "^pos
                         "^alerts?\\b", "^automail", "^system", "^newsletter", "^news\\b"]   # regex on the part before @
 prompt_stories = 30       # open stories shown to the LLM to match a thread to a story
 duplicate_similarity = 0.6
-link_gap_days = 14        # subject-only links older than this do not attach automatically
 export_dir = ""           # story folders, e.g. "out/stories" (empty = off)
 
 [output]

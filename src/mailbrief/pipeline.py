@@ -167,7 +167,10 @@ def run(cfg: Config, now: datetime | None = None, source: MailSource | None = No
                                                  title=f"메일 브리핑 {now:%m/%d %H:%M}",
                                                  full_report=str((out / f"{stem}.html").resolve())).resolve())
         if tracker:
-            rep.stats.update(write_story_views(cfg, tracker, now, ing.stats() if ing else None))
+            try:  # a problem in the story views must not stop the briefing
+                rep.stats.update(write_story_views(cfg, tracker, now, ing.stats() if ing else None))
+            except Exception:
+                log.exception("story dashboard / folder export failed")
         if cfg.output.send_to_self:
             source.send_to_self(f"[메일 브리핑] {now:%m/%d} 놓친 일 {len(rep.missed)}건 · 일정 {len(rep.upcoming_events)}건",
                                 html_body)

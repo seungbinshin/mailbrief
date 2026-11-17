@@ -162,5 +162,7 @@ class Thread:
 
     @property
     def revision(self) -> str:
-        """Changes when a mail is added to the thread. Cache key of the thread analysis."""
-        return hashlib.sha1("|".join(sorted(self.ids)).encode()).hexdigest()[:16]
+        """Cache key of the thread analysis. A new mail is the new latest mail, so it makes a new revision.
+        Older mails that leave the fetch window (lookback, max_mails) do NOT change it: no new LLM call."""
+        last = self.latest
+        return hashlib.sha1((last.message_id.strip().strip("<>").lower() or last.id).encode()).hexdigest()[:16]

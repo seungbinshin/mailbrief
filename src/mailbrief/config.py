@@ -105,7 +105,6 @@ class StoryConfig:
         r"^automail", r"^system", r"^newsletter", r"^news\b"])
     prompt_stories: int = 30        # open stories shown to the LLM for matching
     duplicate_similarity: float = 0.6   # new story similar to an open story -> review "possible_duplicate"
-    link_gap_days: int = 14         # subject-only thread link older than this does not attach automatically
     export_dir: str = ""            # write story folders here (empty = off), e.g. "out/stories"
 
 

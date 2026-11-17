@@ -26,7 +26,9 @@ CREATE TABLE IF NOT EXISTS stories (
   id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT, goal TEXT, owner TEXT, end_condition TEXT,
   status TEXT, flags TEXT, merged_into INTEGER, created TEXT, updated TEXT);
 CREATE TABLE IF NOT EXISTS story_links (
-  key TEXT PRIMARY KEY, story_id INTEGER, how TEXT, last_seen TEXT);
+  key TEXT PRIMARY KEY, story_id INTEGER, how TEXT, last_seen TEXT, people TEXT);
+CREATE TABLE IF NOT EXISTS story_blocks (
+  key TEXT, story_id INTEGER, created TEXT, PRIMARY KEY (key, story_id));
 CREATE TABLE IF NOT EXISTS story_updates (
   id INTEGER PRIMARY KEY AUTOINCREMENT, story_id INTEGER, thread_key TEXT, revision TEXT, email_id TEXT,
   subject TEXT, summary TEXT, source_time TEXT, captured_at TEXT, content_hash TEXT,
@@ -34,8 +36,9 @@ CREATE TABLE IF NOT EXISTS story_updates (
 CREATE TABLE IF NOT EXISTS reviews (
   id INTEGER PRIMARY KEY AUTOINCREMENT, thread_key TEXT UNIQUE, keys TEXT, revision TEXT, email_id TEXT,
   subject TEXT, summary TEXT, category TEXT, reasons TEXT, proposal TEXT, status TEXT, story_id INTEGER,
-  source_time TEXT, created TEXT, updated TEXT);
+  source_time TEXT, created TEXT, updated TEXT, people TEXT);
 """
+_ADDED_COLUMNS = [("story_links", "people", "TEXT"), ("reviews", "people", "TEXT")]
 
 
 class Store:
@@ -48,6 +51,10 @@ class Store:
         cols = [r[1] for r in self.db.execute("PRAGMA table_info(insights)")]
         if "model" not in cols:  # very old schema
             self.db.executescript("DROP TABLE insights;" + _SCHEMA)
+        for table, col, typ in _ADDED_COLUMNS:  # databases made by an earlier version
+            if col not in [r[1] for r in self.db.execute(f"PRAGMA table_info({table})")]:
+                self.db.execute(f"ALTER TABLE {table} ADD COLUMN {col} {typ}")
+        self.db.commit()
 
     def _exec(self, sql: str, args=()):
         with self.lock:

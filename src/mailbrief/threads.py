@@ -5,8 +5,9 @@ Rules, in this order:
      The inbox copy is kept, the sent copy is removed.
   2. Mails with the same conversation_id are one thread.
   3. Mails with the same subject after RE:/FW:/회신:/전달: prefixes are removed are one thread, but only
-     when they have a common participant and are at most `gap_days` apart. This covers sources without
-     conversation_id and Outlook conversations that broke (for example a reply from a mobile client).
+     when at least one of the two has no conversation_id, they have a common participant (not me), and they
+     are at most `gap_days` apart. This covers sources without conversation_id and replies from clients that
+     drop it. Two different Outlook conversations are never joined by subject.
   4. A thread must have at least one inbox mail. A thread of only sent mails is not analyzed.
 
 One thread is one LLM call. "RE: RE: 설계 리뷰" is not a new mail: it is a new revision of the thread.
@@ -36,8 +37,18 @@ def normalize_subject(subject: str) -> str:
     return re.sub(r"\s+", " ", s).strip()
 
 
-def subject_key(subject: str) -> str:
-    return "s:" + hashlib.sha1(normalize_subject(subject).lower().encode()).hexdigest()[:12]
+def mail_key(m: Email) -> str:
+    """Key of a thread without conversation id: subject hash + one mail of the thread.
+    The mail part makes it unique: a later thread with the same generic subject ("자료 요청") gets another key.
+    A thread keeps all its mail keys (Thread.keys), so a story link stays when old mails leave the window."""
+    subj = normalize_subject(m.subject).lower()
+    who = (m.message_id.strip().strip("<>").lower() or m.id).encode()
+    head = "s:" + hashlib.sha1(subj.encode()).hexdigest()[:10] if subj else "m"
+    return f"{head}:{hashlib.sha1(who).hexdigest()[:8]}"
+
+
+def thread_people(thread, me: str) -> set[str]:
+    return set().union(*(participants(m, me) for m in thread.mails)) if thread.mails else set()
 
 
 def is_mine(mail: Email, me: str) -> bool:
@@ -58,7 +69,7 @@ def remove_copies(mails: list[Email]) -> list[Email]:
     return list(seen.values())
 
 
-def _participants(m: Email, me: str) -> set[str]:
+def participants(m: Email, me: str) -> set[str]:
     p = {a.lower() for a in [m.sender, *m.to, *m.cc] if a}
     p.discard(me.lower() if me else "")
     return p
@@ -101,9 +112,11 @@ def group_threads(mails: list[Email], me: str = "", skip_senders: list[str] | No
     gap = timedelta(days=gap_days)
     for idx in by_subj.values():
         for k, i in enumerate(idx):
-            pi = _participants(ms[i], me)
+            pi = participants(ms[i], me)
             for j in idx[:k]:
-                if ms[i].received - ms[j].received <= gap and (pi & _participants(ms[j], me)):
+                if ms[i].conversation_id and ms[j].conversation_id:
+                    continue  # two Outlook conversations: trust the conversation id, not the subject
+                if ms[i].received - ms[j].received <= gap and (pi & participants(ms[j], me)):
                     u.join(i, j)
 
     groups: dict[int, list[Email]] = {}
@@ -111,19 +124,12 @@ def group_threads(mails: list[Email], me: str = "", skip_senders: list[str] | No
         groups.setdefault(u.find(i), []).append(m)
 
     out: list[Thread] = []
-    used: set[str] = set()
-    for g in sorted(groups.values(), key=lambda g: g[0].received):
+    for g in groups.values():
         if not any(m.folder == "inbox" for m in g):
             continue
         convs = [m.conversation_id for m in g if m.conversation_id]
-        keys = {f"c:{c}" for c in convs}
-        skey = subject_key(g[0].subject) if normalize_subject(g[0].subject) else f"m:{g[0].id}"
-        if skey in used:  # same subject, other people: a different thread
-            skey = f"{skey}:{hashlib.sha1(g[0].id.encode()).hexdigest()[:6]}"
-        if len(convs) < len(g):  # at least one mail without conversation id
-            keys.add(skey)
-        key = f"c:{convs[0]}" if convs else skey
-        used.add(skey)
+        keys = {f"c:{c}" for c in convs} | {mail_key(m) for m in g if not m.conversation_id}
+        key = f"c:{convs[0]}" if convs else mail_key(g[0])
         subj = normalize_subject(g[-1].subject) or normalize_subject(g[0].subject) or "(제목 없음)"
         out.append(Thread(key=key, subject=subj, mails=g, keys=keys))
     out.sort(key=lambda t: t.latest.received, reverse=True)

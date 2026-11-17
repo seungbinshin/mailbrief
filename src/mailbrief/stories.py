@@ -18,6 +18,9 @@ Routes (judge):
 Review state is derived, not stored as a flag: a story with no owner or no end condition shows in the review
 queue, and it leaves the queue when the owner and the end condition are set.
 
+User decisions hold: a dismissed thread is not attached or promoted by a later LLM answer (only a clear story
+is asked again, as "reopened"), and a thread removed with `story unlink` is not attached to that story again.
+
 Story updates are append-only. Each update has the full source time and capture time (not only the date),
 and a content hash. Only an exact copy (same thread revision and summary) is skipped. Merge does not delete.
 """
@@ -28,11 +31,11 @@ import json
 import re
 from collections import Counter
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 
 from .analyze import _similar
 from .models import MailInsight, Thread
-from .threads import is_mine
+from .threads import is_mine, thread_people
 
 ROUTES = ("story", "review", "none")
 
@@ -159,6 +162,7 @@ class ReviewItem:
     source_time: str
     created: str
     updated: str
+    people: list[str] = field(default_factory=list)
 
     @property
     def rid(self) -> str:
@@ -169,7 +173,7 @@ class ReviewItem:
         return cls(d["id"], d["thread_key"], json.loads(d["keys"] or "[]"), d["revision"], d["email_id"],
                    d["subject"] or "", d["summary"] or "", d["category"] or "", json.loads(d["reasons"] or "[]"),
                    json.loads(d["proposal"] or "{}"), d["status"], d["story_id"], d["source_time"], d["created"],
-                   d["updated"])
+                   d["updated"], json.loads(d.get("people") or "[]"))
 
 
 @dataclass
@@ -184,6 +188,17 @@ class IngestResult:
         return {"threads": sum(self.routes.values()), **{k: self.routes.get(k, 0) for k in (*ROUTES, "pending")},
                 "stories_created": len(self.created), "stories_updated": len(self.attached),
                 "reviews_opened": len(self.reviews)}
+
+
+@dataclass
+class Plan:
+    """What ingest will do with one thread. Read-only: `mailbrief eval` uses the same plan."""
+    route: str                          # story | review | none | pending
+    action: str                         # attach | create | review | keep | none | pending
+    story: "Story | None" = None        # attach target
+    how: str = ""                       # thread | match | new
+    reasons: list[str] = field(default_factory=list)
+    prev: "ReviewItem | None" = None
 
 
 # ---------------------------------------------------------------- tracker
@@ -239,19 +254,27 @@ class StoryTracker:
         return [(s.sid, s.title, s.goal) for s in self.stories()[:n]]
 
     def linked_story(self, thread: Thread) -> Story | None:
-        gap = timedelta(days=self.cfg.link_gap_days)
+        people = thread_people(thread, self.me)
         for key in sorted(thread.keys | {thread.key}):
-            rows = self.store.query("SELECT story_id, last_seen FROM story_links WHERE key=?", (key,))
+            rows = self.store.query("SELECT story_id, people FROM story_links WHERE key=?", (key,))
             if not rows:
                 continue
-            if key.startswith("s:") and rows[0]["last_seen"]:
-                # A subject-only link is weak: a later thread with the same generic subject is another thread.
-                if thread.mails[0].received - datetime.fromisoformat(rows[0]["last_seen"]) > gap:
+            if key.startswith("s:"):
+                # Subject keys contain one mail of the thread, so a match means a shared mail. Also require a
+                # common participant: one more guard against a wrong subject join.
+                linked_people = set(json.loads(rows[0]["people"] or "[]"))
+                if linked_people and people and not (linked_people & people):
                     continue
             st = self.get(rows[0]["story_id"])
             if st:
                 return st
         return None
+
+    def _blocked(self, thread: Thread, story_id: int) -> bool:
+        keys = sorted(thread.keys | {thread.key})
+        q = ",".join("?" * len(keys))
+        return bool(self.store.query(f"SELECT 1 FROM story_blocks WHERE story_id=? AND key IN ({q})",
+                                     (story_id, *keys)))
 
     def _review_for(self, thread: Thread) -> ReviewItem | None:
         rows = self.store.query("SELECT * FROM reviews WHERE thread_key=?", (thread.key,))
@@ -268,11 +291,20 @@ class StoryTracker:
         self.store._exec("UPDATE stories SET flags=? WHERE id=?", (json.dumps(sorted(set(flags))), st.id))
         st.flags = sorted(set(flags))
 
-    def _link(self, story_id: int, keys, how: str, seen: str) -> None:
+    def _link(self, story_id: int, keys, how: str, seen: str, thread: Thread | None = None,
+              people: set[str] | None = None) -> None:
+        ppl = set(people or ()) | (thread_people(thread, self.me) if thread else set())
         for k in keys:
-            self.store._exec("INSERT OR IGNORE INTO story_links VALUES (?,?,?,?)", (k, story_id, how, seen))
+            self.store._exec("INSERT OR IGNORE INTO story_links(key, story_id, how, last_seen, people) VALUES (?,?,?,?,?)",
+                             (k, story_id, how, seen, "[]"))
             self.store._exec("UPDATE story_links SET last_seen=? WHERE key=? AND story_id=? AND last_seen < ?",
                              (seen, k, story_id, seen))
+            if ppl:
+                rows = self.store.query("SELECT people FROM story_links WHERE key=? AND story_id=?", (k, story_id))
+                if rows:
+                    merged = sorted(set(json.loads(rows[0]["people"] or "[]")) | ppl)
+                    self.store._exec("UPDATE story_links SET people=? WHERE key=? AND story_id=?",
+                                     (json.dumps(merged), k, story_id))
 
     def _add_update(self, story_id: int, thread_key: str, revision: str, email_id: str, subject: str,
                     summary: str, source_time: str, now: datetime) -> bool:
@@ -287,7 +319,7 @@ class StoryTracker:
 
     def _attach(self, st: Story, thread: Thread, ins: MailInsight, how: str, now: datetime) -> bool:
         seen = _utc(thread.latest.received)
-        self._link(st.id, sorted(thread.keys | {thread.key}), how, seen)
+        self._link(st.id, sorted(thread.keys | {thread.key}), how, seen, thread)
         new = self._add_update(st.id, thread.key, thread.revision, thread.latest.id, thread.latest.subject,
                                ins.summary, seen, now)
         if new and ins.story.done and st.status == "active":
@@ -321,15 +353,16 @@ class StoryTracker:
                     "end_condition": s.end_condition, "confidence": s.confidence}
         vals = (json.dumps(sorted(thread.keys | {thread.key})), thread.revision, thread.latest.id,
                 thread.latest.subject, ins.summary, ins.category, json.dumps(reasons, ensure_ascii=False),
-                json.dumps(proposal, ensure_ascii=False), "open", _utc(thread.latest.received), _utc_now(now))
+                json.dumps(proposal, ensure_ascii=False), "open", _utc(thread.latest.received), _utc_now(now),
+                json.dumps(sorted(thread_people(thread, self.me))))
         if prev:
             self.store._exec("UPDATE reviews SET keys=?, revision=?, email_id=?, subject=?, summary=?, category=?, "
-                             "reasons=?, proposal=?, status=?, source_time=?, updated=?, thread_key=? WHERE id=?",
-                             (*vals, thread.key, prev.id))
+                             "reasons=?, proposal=?, status=?, source_time=?, updated=?, people=?, thread_key=? "
+                             "WHERE id=?", (*vals, thread.key, prev.id))
             return self.review(prev.id)
         cur = self.store._exec(
             "INSERT INTO reviews(keys, revision, email_id, subject, summary, category, reasons, proposal, status, "
-            "source_time, updated, thread_key, created) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "source_time, updated, people, thread_key, created) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (*vals, thread.key, _utc_now(now)))
         return self.review(cur.lastrowid)
 
@@ -349,43 +382,55 @@ class StoryTracker:
             res.by_thread[t.key] = route
         return res
 
-    def _ingest_one(self, t: Thread, ins: MailInsight, now: datetime, res: IngestResult) -> str:
+    def plan(self, t: Thread, ins: MailInsight) -> Plan:
+        """Decide without writing. Order: LLM failed -> linked story -> LLM match -> judge."""
         if not ins.by_llm:
-            return "pending"  # LLM failed: no decision. The fallback result is not cached, so the next run retries.
+            return Plan("pending", "pending")  # the fallback result is not cached: the next run retries
         linked = self.linked_story(t)
         if linked:
-            if self._attach(linked, t, ins, "thread", now):
-                res.attached.append((linked, t))
-            return "story"
+            return Plan("story", "attach", linked, "thread")
         v = judge(t, ins, self.cfg, self.me)
         prev = self._review_for(t)
+        # The user said "not a story" (dismissed), or was asked again and has not answered (reopened).
+        hold = prev is not None and (prev.status == "dismissed" or (prev.status == "open" and "reopened" in prev.reasons))
         match = self.get(ins.story.match_id) if ins.story.match_id else None
-        if match and match.status == "active" and not v.noise:
-            self._attach(match, t, ins, "match", now)
-            self._close_review(prev if prev and prev.status == "open" else None, "promoted", match.id, now)
-            res.attached.append((match, t))
-            return "story"
+        if match and match.status == "active" and not v.noise and not hold and not self._blocked(t, match.id):
+            return Plan("story", "attach", match, "match", prev=prev)
         if v.route == "story":
+            if hold:
+                same = prev.status == "open" and prev.revision == t.revision
+                return Plan("review", "keep" if same else "review", reasons=["reopened"], prev=prev)
+            return Plan("story", "create", how="new", prev=prev)
+        if v.route == "review":
             if prev and prev.status == "dismissed":
-                item = self._upsert_review(t, ins, ["reopened"], prev, now)
-                res.reviews.append((item, t))
-                return "review"
+                return Plan("none", "none", prev=prev)
+            if prev and prev.status == "open":
+                if prev.revision == t.revision:
+                    return Plan("review", "keep", reasons=prev.reasons, prev=prev)
+                return Plan("review", "review", reasons=["reopened"] if hold else v.reasons, prev=prev)
+            return Plan("review", "review", reasons=v.reasons, prev=prev)
+        return Plan("none", "none", prev=prev)
+
+    def _ingest_one(self, t: Thread, ins: MailInsight, now: datetime, res: IngestResult) -> str:
+        p = self.plan(t, ins)
+        if p.action == "attach":
+            new = self._attach(p.story, t, ins, p.how, now)
+            if p.how == "match" and p.prev and p.prev.status == "open":
+                self._close_review(p.prev, "promoted", p.story.id, now)
+            if new or p.how == "match":
+                res.attached.append((p.story, t))
+        elif p.action == "create":
             s = ins.story
             st = self._create(s.title or t.subject, s.goal, s.owner, s.end_condition, _utc(t.latest.received))
             self._attach(st, t, ins, "new", now)
-            self._close_review(prev if prev and prev.status == "open" else None, "promoted", st.id, now)
+            if p.prev and p.prev.status == "open":
+                self._close_review(p.prev, "promoted", st.id, now)
             res.created.append((self.get(st.id), t))
-            return "story"
-        if v.route == "review":
-            if prev and prev.status == "dismissed":
-                return "none"  # the user said "not a story" for this thread
-            if prev and prev.status == "open" and prev.revision == t.revision:
-                return "review"
-            item = self._upsert_review(t, ins, v.reasons, prev, now)
-            if not prev or prev.status != "open":
+        elif p.action == "review":
+            item = self._upsert_review(t, ins, p.reasons, p.prev, now)
+            if not p.prev or p.prev.status != "open":
                 res.reviews.append((item, t))
-            return "review"
-        return "none"
+        return p.route
 
     # ---------- user actions (CLI)
     def new(self, title: str, now: datetime, goal: str = "", owner: str = "", end: str = "") -> Story:
@@ -399,6 +444,8 @@ class StoryTracker:
         item = self.review(rid)
         if not item:
             raise ValueError(f"no review item {rid}")
+        if item.status == "promoted":
+            raise ValueError(f"{item.rid} is already promoted to S{item.story_id}")
         p = item.proposal
         if into:
             st = self.get(into)
@@ -407,7 +454,10 @@ class StoryTracker:
         else:
             st = self._create(title or p.get("title") or item.subject, goal or p.get("goal", ""),
                               owner or p.get("owner", ""), end or p.get("end_condition", ""), item.source_time)
-        self._link(st.id, item.keys or [item.thread_key], "promote", item.source_time)
+        keys = item.keys or [item.thread_key]
+        q = ",".join("?" * len(keys))
+        self.store._exec(f"DELETE FROM story_blocks WHERE story_id=? AND key IN ({q})", (st.id, *keys))
+        self._link(st.id, keys, "promote", item.source_time, people=set(item.people))
         self._add_update(st.id, item.thread_key, item.revision, item.email_id, item.subject, item.summary,
                          item.source_time, now)
         self._close_review(item, "promoted", st.id, now)
@@ -453,6 +503,7 @@ class StoryTracker:
         st._exec("UPDATE OR IGNORE story_updates SET story_id=? WHERE story_id=?", (dst.id, src.id))
         st._exec("DELETE FROM story_updates WHERE story_id=?", (src.id,))  # only exact copies remain here
         st._exec("UPDATE reviews SET story_id=? WHERE story_id=?", (dst.id, src.id))
+        st._exec("UPDATE OR IGNORE story_blocks SET story_id=? WHERE story_id=?", (dst.id, src.id))
         for k in ("goal", "owner", "end_condition"):
             if not getattr(dst, k) and getattr(src, k):
                 st._exec(f"UPDATE stories SET {k}=? WHERE id=?", (getattr(src, k), dst.id))
@@ -462,8 +513,13 @@ class StoryTracker:
         return self.get(dst.id)
 
     def unlink(self, sid, key: str) -> int:
+        """Remove a thread from a story. The block stays: a later LLM match does not attach it again."""
         st = self._need(sid)
-        return self.store._exec("DELETE FROM story_links WHERE key=? AND story_id=?", (key, st.id)).rowcount
+        n = self.store._exec("DELETE FROM story_links WHERE key=? AND story_id=?", (key, st.id)).rowcount
+        if n:
+            self.store._exec("INSERT OR IGNORE INTO story_blocks VALUES (?,?,?)",
+                             (key, st.id, datetime.now(timezone.utc).isoformat()))
+        return n
 
     def _need(self, sid) -> Story:
         st = self.get(sid)

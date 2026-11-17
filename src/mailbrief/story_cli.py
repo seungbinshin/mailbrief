@@ -116,5 +116,8 @@ def story_command(cfg: Config, action: str, ids: list[str], owner=None, end=None
     except ValueError as e:
         print(f"error: {e}")
         return 2
-    write_story_views(cfg, tr, now)
+    try:
+        write_story_views(cfg, tr, now)
+    except Exception as e:  # the change is saved; only the views failed
+        print(f"warning: dashboard / folders not written: {e}")
     return 0
